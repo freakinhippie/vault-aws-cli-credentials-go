@@ -1,0 +1,9 @@
+/bin/
+/dist/
+.cache/
+*.exe
+*.zip
+*.tar.gz
+
+# Go build/test caches
+.coverprofile

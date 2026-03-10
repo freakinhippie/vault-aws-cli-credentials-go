@@ -1,0 +1,128 @@
+version: 2
+
+project_name: vaultcreds
+
+snapshot:
+  version_template: "{{ if .Env.VERSION }}{{ .Env.VERSION }}{{ else }}{{ .Version }}{{ end }}-SNAPSHOT"
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: vaultcreds-linux
+    main: ./cmd/vaultcreds
+    binary: vaultcreds
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+  - id: vaultcreds-windows
+    main: ./cmd/vaultcreds
+    binary: vaultcreds
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+  - id: vaultcreds-darwin
+    main: ./cmd/vaultcreds
+    binary: vaultcreds
+    env:
+      - CGO_ENABLED=1
+    goos:
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - id: vaultcreds-archives
+    ids:
+      - vaultcreds-linux
+      - vaultcreds-windows
+      - vaultcreds-darwin
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64{{ else if eq .Arch "386" }}i386{{ else }}{{ .Arch }}{{ end }}
+
+checksum:
+  name_template: checksums.txt
+
+nfpms:
+  - id: vaultcreds-packages
+    ids:
+      - vaultcreds-linux
+    package_name: vaultcreds
+    file_name_template: "{{ .ConventionalFileName }}"
+    bindir: /usr/bin
+    formats:
+      - deb
+      - rpm
+      - apk
+      - archlinux
+    maintainer: "Vault AWS Credentials Helper Maintainers"
+    description: "Vault AWS CLI/SDK external credential process helper"
+    homepage: "https://github.com/freakinhippie/vault-aws-cli-credentials-go"
+    section: utils
+    priority: optional
+
+homebrew_casks:
+  - name: vaultcreds
+    ids:
+      - vaultcreds-archives
+    repository:
+      owner: freakinhippie
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: "https://github.com/freakinhippie/vault-aws-cli-credentials-go"
+    description: "Vault AWS CLI/SDK external credential process helper"
+    license: "Apache-2.0"
+
+chocolateys:
+  - name: vaultcreds
+    ids:
+      - vaultcreds-archives
+    title: "Vault AWS CLI/SDK Credentials Helper"
+    authors: "Vault AWS Credentials Helper Maintainers"
+    project_url: "https://github.com/freakinhippie/vault-aws-cli-credentials-go"
+    url_template: "https://github.com/freakinhippie/vault-aws-cli-credentials-go/releases/download/{{ .Tag }}/{{ .ArtifactName }}"
+    icon_url: "https://raw.githubusercontent.com/freakinhippie/vault-aws-cli-credentials-go/main/.github/assets/vaultcreds-icon.png"
+    license_url: "https://github.com/freakinhippie/vault-aws-cli-credentials-go/blob/main/LICENSE"
+    require_license_acceptance: false
+    project_source_url: "https://github.com/freakinhippie/vault-aws-cli-credentials-go"
+    docs_url: "https://github.com/freakinhippie/vault-aws-cli-credentials-go#readme"
+    bug_tracker_url: "https://github.com/freakinhippie/vault-aws-cli-credentials-go/issues"
+    tags: "vault aws credentials"
+    summary: "Vault AWS CLI/SDK external credential process helper"
+    description: "Fetches short-lived AWS credentials from Vault/OpenBao for use with AWS credential_process."
+    release_notes: "https://github.com/freakinhippie/vault-aws-cli-credentials-go/releases/tag/{{ .Tag }}"
+    source_repo: "https://push.chocolatey.org/"
+    api_key: "{{ .Env.CHOCOLATEY_API_KEY }}"
+
+changelog:
+  use: git
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
