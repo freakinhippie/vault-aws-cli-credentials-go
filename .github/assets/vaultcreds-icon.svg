@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="vaultcreds icon option 3">
+  <defs>
+    <radialGradient id="bg3" cx="35%" cy="25%" r="90%">
+      <stop offset="0%" stop-color="#5A6B80"/>
+      <stop offset="100%" stop-color="#1A2432"/>
+    </radialGradient>
+    <linearGradient id="steel3" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#E6EDF4"/>
+      <stop offset="100%" stop-color="#9DAFC2"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="96" fill="url(#bg3)"/>
+  <circle cx="256" cy="256" r="164" fill="#2A3545"/>
+  <circle cx="256" cy="256" r="152" fill="none" stroke="#8FA7BF" stroke-width="12"/>
+  <circle cx="256" cy="256" r="116" fill="url(#steel3)"/>
+  <circle cx="256" cy="256" r="88" fill="#233142"/>
+  <circle cx="256" cy="256" r="24" fill="#E6EDF4"/>
+  <g fill="#C9D8E6">
+    <circle cx="256" cy="132" r="10"/>
+    <circle cx="380" cy="256" r="10"/>
+    <circle cx="256" cy="380" r="10"/>
+    <circle cx="132" cy="256" r="10"/>
+  </g>
+  <path d="M184 336c22-30 52-45 72-45s50 15 72 45" fill="none" stroke="#6CC0FF" stroke-width="16" stroke-linecap="round"/>
+</svg>

@@ -25,6 +25,8 @@ From Chocolatey:
 choco install vaultcreds
 ```
 
+Chocolatey packages are published by a dedicated Windows GitHub Actions workflow after each GitHub release is published.
+
 From release artifacts: download the package for your OS/architecture and place `vaultcreds` on your `PATH`.
 
 ## Configuration
@@ -152,6 +154,10 @@ make fmt
 make vet
 make tidy
 ```
+
+## Releasing
+
+See [`RELEASING.md`](RELEASING.md) for one-time setup (GitHub secrets, Homebrew tap, Chocolatey account/API key) and the tag-based release workflow.
 
 ## License
 

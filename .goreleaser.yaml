@@ -93,7 +93,9 @@ homebrew_casks:
     repository:
       owner: freakinhippie
       name: homebrew-tap
-      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+      git:
+        url: "ssh://git@github.com/freakinhippie/homebrew-tap.git"
+        private_key: "{{ .Env.HOMEBREW_TAP_SSH_KEY }}"
     homepage: "https://github.com/freakinhippie/vault-aws-cli-credentials-go"
     description: "Vault AWS CLI/SDK external credential process helper"
     license: "Apache-2.0"
