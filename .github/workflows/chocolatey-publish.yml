@@ -1,0 +1,137 @@
+name: Chocolatey Publish
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish (for example v1.2.3)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish-chocolatey:
+    runs-on: windows-latest
+    env:
+      PACKAGE_ID: vaultcreds
+      CHOCOLATEY_SOURCE: https://push.chocolatey.org/
+    steps:
+      - name: Resolve tag
+        id: tag
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "release") {
+            $tag = "${{ github.event.release.tag_name }}"
+          } else {
+            $tag = "${{ inputs.tag }}"
+          }
+          if (-not $tag -or $tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+') {
+            throw "Tag must match vX.Y.Z"
+          }
+          $version = $tag.TrimStart('v')
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Verify Chocolatey API key
+        shell: pwsh
+        run: |
+          if (-not "${{ secrets.CHOCOLATEY_API_KEY }}") {
+            throw "Missing CHOCOLATEY_API_KEY repository secret"
+          }
+
+      - name: Build Chocolatey package from release assets
+        id: build
+        shell: pwsh
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          VERSION: ${{ steps.tag.outputs.version }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $assetName = "vaultcreds_${env:TAG}_windows_x86_64.zip"
+          $baseUrl = "https://github.com/$env:REPOSITORY/releases/download/$env:TAG"
+          $zipUrl = "$baseUrl/$assetName"
+          $checksumsUrl = "$baseUrl/checksums.txt"
+          $releaseNotesUrl = "https://github.com/$env:REPOSITORY/releases/tag/$env:TAG"
+          $projectUrl = "https://github.com/$env:REPOSITORY"
+
+          $checksumsPath = Join-Path $env:RUNNER_TEMP "checksums.txt"
+          Invoke-WebRequest -Uri $checksumsUrl -OutFile $checksumsPath
+
+          $line = Get-Content $checksumsPath | Where-Object { $_ -match [Regex]::Escape($assetName) } | Select-Object -First 1
+          if (-not $line) {
+            throw "Could not find checksum entry for $assetName in checksums.txt"
+          }
+          $checksum = ($line -split '\s+')[0].Trim()
+          if (-not $checksum) {
+            throw "Parsed checksum was empty for $assetName"
+          }
+
+          $pkgRoot = Join-Path $env:RUNNER_TEMP "choco\$env:PACKAGE_ID"
+          $toolsDir = Join-Path $pkgRoot "tools"
+          New-Item -ItemType Directory -Path $toolsDir -Force | Out-Null
+
+          $nuspecPath = Join-Path $pkgRoot "$env:PACKAGE_ID.nuspec"
+          @"
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>$env:PACKAGE_ID</id>
+    <version>$env:VERSION</version>
+    <title>Vault AWS CLI/SDK Credentials Helper</title>
+    <authors>Vault AWS Credentials Helper Maintainers</authors>
+    <projectUrl>$projectUrl</projectUrl>
+    <licenseUrl>$projectUrl/blob/main/LICENSE</licenseUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <projectSourceUrl>$projectUrl</projectSourceUrl>
+    <docsUrl>$projectUrl#readme</docsUrl>
+    <bugTrackerUrl>$projectUrl/issues</bugTrackerUrl>
+    <tags>vault aws credentials</tags>
+    <summary>Vault AWS CLI/SDK external credential process helper</summary>
+    <description>Fetches short-lived AWS credentials from Vault/OpenBao for use with AWS CLI/SDK credential_process.</description>
+    <releaseNotes>$releaseNotesUrl</releaseNotes>
+  </metadata>
+</package>
+"@ | Out-File -FilePath $nuspecPath -Encoding utf8
+
+          $installScriptPath = Join-Path $toolsDir "chocolateyinstall.ps1"
+          @"
+$ErrorActionPreference = 'Stop'
+
+$packageName = '$env:PACKAGE_ID'
+$toolsDir = Split-Path -Parent `$MyInvocation.MyCommand.Definition
+
+$packageArgs = @{
+  packageName   = `$packageName
+  unzipLocation = `$toolsDir
+  url64bit      = '$zipUrl'
+  checksum64    = '$checksum'
+  checksumType64 = 'sha256'
+}
+
+Install-ChocolateyZipPackage @packageArgs
+"@ | Out-File -FilePath $installScriptPath -Encoding utf8
+
+          $outDir = Join-Path $env:RUNNER_TEMP "choco\out"
+          New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+          choco pack $nuspecPath --outputdirectory $outDir
+
+          $nupkg = Get-ChildItem -Path $outDir -Filter "$env:PACKAGE_ID.$env:VERSION.nupkg" | Select-Object -First 1
+          if (-not $nupkg) {
+            throw "Unable to find generated Chocolatey package"
+          }
+          "nupkg=$($nupkg.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Publish package to Chocolatey
+        shell: pwsh
+        env:
+          CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
+          NUPKG: ${{ steps.build.outputs.nupkg }}
+        run: |
+          choco push "$env:NUPKG" --source "$env:CHOCOLATEY_SOURCE" --api-key "$env:CHOCOLATEY_API_KEY"
