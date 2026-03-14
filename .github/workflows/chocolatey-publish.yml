@@ -102,12 +102,12 @@ jobs:
 
           $installScriptPath = Join-Path $toolsDir "chocolateyinstall.ps1"
           @"
-          $ErrorActionPreference = 'Stop'
+          `$ErrorActionPreference = 'Stop'
 
-          $packageName = '$env:PACKAGE_ID'
-          $toolsDir = Split-Path -Parent `$MyInvocation.MyCommand.Definition
+          `$packageName = '$env:PACKAGE_ID'
+          `$toolsDir = Split-Path -Parent `$MyInvocation.MyCommand.Definition
 
-          $packageArgs = @{
+          `$packageArgs = @{
             packageName   = `$packageName
             unzipLocation = `$toolsDir
             url64bit      = '$zipUrl'
