@@ -54,7 +54,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          $assetName = "vaultcreds_${env:TAG}_windows_x86_64.zip"
+          $assetName = "vaultcreds_${env:VERSION}_windows_x86_64.zip"
           $baseUrl = "https://github.com/$env:REPOSITORY/releases/download/$env:TAG"
           $zipUrl = "$baseUrl/$assetName"
           $checksumsUrl = "$baseUrl/checksums.txt"
