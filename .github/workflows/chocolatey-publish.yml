@@ -79,44 +79,44 @@ jobs:
 
           $nuspecPath = Join-Path $pkgRoot "$env:PACKAGE_ID.nuspec"
           @"
-<?xml version="1.0" encoding="utf-8"?>
-<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
-  <metadata>
-    <id>$env:PACKAGE_ID</id>
-    <version>$env:VERSION</version>
-    <title>Vault AWS CLI/SDK Credentials Helper</title>
-    <authors>Vault AWS Credentials Helper Maintainers</authors>
-    <projectUrl>$projectUrl</projectUrl>
-    <licenseUrl>$projectUrl/blob/main/LICENSE</licenseUrl>
-    <requireLicenseAcceptance>false</requireLicenseAcceptance>
-    <projectSourceUrl>$projectUrl</projectSourceUrl>
-    <docsUrl>$projectUrl#readme</docsUrl>
-    <bugTrackerUrl>$projectUrl/issues</bugTrackerUrl>
-    <tags>vault aws credentials</tags>
-    <summary>Vault AWS CLI/SDK external credential process helper</summary>
-    <description>Fetches short-lived AWS credentials from Vault/OpenBao for use with AWS CLI/SDK credential_process.</description>
-    <releaseNotes>$releaseNotesUrl</releaseNotes>
-  </metadata>
-</package>
-"@ | Out-File -FilePath $nuspecPath -Encoding utf8
+          <?xml version="1.0" encoding="utf-8"?>
+          <package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+            <metadata>
+              <id>$env:PACKAGE_ID</id>
+              <version>$env:VERSION</version>
+              <title>Vault AWS CLI/SDK Credentials Helper</title>
+              <authors>Vault AWS Credentials Helper Maintainers</authors>
+              <projectUrl>$projectUrl</projectUrl>
+              <licenseUrl>$projectUrl/blob/main/LICENSE</licenseUrl>
+              <requireLicenseAcceptance>false</requireLicenseAcceptance>
+              <projectSourceUrl>$projectUrl</projectSourceUrl>
+              <docsUrl>$projectUrl#readme</docsUrl>
+              <bugTrackerUrl>$projectUrl/issues</bugTrackerUrl>
+              <tags>vault aws credentials</tags>
+              <summary>Vault AWS CLI/SDK external credential process helper</summary>
+              <description>Fetches short-lived AWS credentials from Vault/OpenBao for use with AWS CLI/SDK credential_process.</description>
+              <releaseNotes>$releaseNotesUrl</releaseNotes>
+            </metadata>
+          </package>
+          "@ | Out-File -FilePath $nuspecPath -Encoding utf8
 
           $installScriptPath = Join-Path $toolsDir "chocolateyinstall.ps1"
           @"
-$ErrorActionPreference = 'Stop'
+          $ErrorActionPreference = 'Stop'
 
-$packageName = '$env:PACKAGE_ID'
-$toolsDir = Split-Path -Parent `$MyInvocation.MyCommand.Definition
+          $packageName = '$env:PACKAGE_ID'
+          $toolsDir = Split-Path -Parent `$MyInvocation.MyCommand.Definition
 
-$packageArgs = @{
-  packageName   = `$packageName
-  unzipLocation = `$toolsDir
-  url64bit      = '$zipUrl'
-  checksum64    = '$checksum'
-  checksumType64 = 'sha256'
-}
+          $packageArgs = @{
+            packageName   = `$packageName
+            unzipLocation = `$toolsDir
+            url64bit      = '$zipUrl'
+            checksum64    = '$checksum'
+            checksumType64 = 'sha256'
+          }
 
-Install-ChocolateyZipPackage @packageArgs
-"@ | Out-File -FilePath $installScriptPath -Encoding utf8
+          Install-ChocolateyZipPackage @packageArgs
+          "@ | Out-File -FilePath $installScriptPath -Encoding utf8
 
           $outDir = Join-Path $env:RUNNER_TEMP "choco\out"
           New-Item -ItemType Directory -Path $outDir -Force | Out-Null
