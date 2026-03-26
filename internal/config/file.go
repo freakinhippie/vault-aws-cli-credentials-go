@@ -9,6 +9,7 @@ import (
 )
 
 func parseConfigFile(path string) (fileConfig, error) {
+	// #nosec G304 -- The config file path is explicitly selected by the user via flag or environment variable.
 	f, err := os.Open(path)
 	if err != nil {
 		return fileConfig{}, fmt.Errorf("open config file: %w", err)

@@ -16,6 +16,7 @@ type TokenResolver struct {
 	HomeDir     string
 	ReadFile    func(path string) ([]byte, error)
 	ExecCommand func(name string, args ...string) (string, error)
+	LookPath    func(file string) (string, error)
 }
 
 type TokenOptions struct {
@@ -25,15 +26,7 @@ type TokenOptions struct {
 
 func NewTokenResolver() *TokenResolver {
 	return &TokenResolver{
-		ReadFile: os.ReadFile,
-		ExecCommand: func(name string, args ...string) (string, error) {
-			cmd := exec.Command(name, args...)
-			out, err := cmd.Output()
-			if err != nil {
-				return "", err
-			}
-			return strings.TrimSpace(string(out)), nil
-		},
+		LookPath: exec.LookPath,
 	}
 }
 
@@ -70,7 +63,7 @@ func (r *TokenResolver) discoverTokenHelper() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	b, err := r.readFile(filepath.Join(home, ".vault"))
+	b, err := r.readHomeFile(home, ".vault")
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return "", nil
@@ -113,8 +106,13 @@ func (r *TokenResolver) tokenFromHelper(helper string) (string, error) {
 		return "", errors.New("token helper command is empty")
 	}
 
+	name, err := r.resolveExecutable(parts[0])
+	if err != nil {
+		return "", err
+	}
+
 	args := append(parts[1:], "get")
-	out, err := r.execCommand(parts[0], args...)
+	out, err := r.execCommand(name, args...)
 	if err != nil {
 		return "", fmt.Errorf("token helper get failed: %w", err)
 	}
@@ -126,7 +124,7 @@ func (r *TokenResolver) tokenFromFile() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	b, err := r.readFile(filepath.Join(home, ".vault-token"))
+	b, err := r.readHomeFile(home, ".vault-token")
 	if err != nil {
 		return "", err
 	}
@@ -144,15 +142,38 @@ func (r *TokenResolver) homeDir() (string, error) {
 	return home, nil
 }
 
-func (r *TokenResolver) readFile(path string) ([]byte, error) {
-	if r.ReadFile == nil {
-		return os.ReadFile(path)
+func (r *TokenResolver) readHomeFile(home, name string) ([]byte, error) {
+	if r.ReadFile != nil {
+		return r.ReadFile(filepath.Join(home, name))
 	}
-	return r.ReadFile(path)
+
+	root, err := os.OpenRoot(home)
+	if err != nil {
+		return nil, fmt.Errorf("open home directory: %w", err)
+	}
+	defer root.Close()
+
+	return root.ReadFile(name)
+}
+
+func (r *TokenResolver) resolveExecutable(name string) (string, error) {
+	if name == "" {
+		return "", errors.New("token helper command is empty")
+	}
+	if hasPathSeparator(name) {
+		return name, nil
+	}
+
+	resolved, err := r.lookPath(name)
+	if err != nil {
+		return "", fmt.Errorf("resolve token helper %q: %w", name, err)
+	}
+	return resolved, nil
 }
 
 func (r *TokenResolver) execCommand(name string, args ...string) (string, error) {
 	if r.ExecCommand == nil {
+		// #nosec G204 -- Token helpers are explicitly configured by the user/Vault and executed without a shell.
 		cmd := exec.Command(name, args...)
 		out, err := cmd.Output()
 		if err != nil {
@@ -161,6 +182,17 @@ func (r *TokenResolver) execCommand(name string, args ...string) (string, error)
 		return strings.TrimSpace(string(out)), nil
 	}
 	return r.ExecCommand(name, args...)
+}
+
+func (r *TokenResolver) lookPath(file string) (string, error) {
+	if r.LookPath == nil {
+		return exec.LookPath(file)
+	}
+	return r.LookPath(file)
+}
+
+func hasPathSeparator(v string) bool {
+	return strings.ContainsAny(v, `/\`)
 }
 
 func splitCommand(input string) ([]string, error) {

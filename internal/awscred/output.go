@@ -14,5 +14,6 @@ func (p ProcessOutput) JSON() ([]byte, error) {
 	if p.Version == 0 {
 		p.Version = 1
 	}
+	// #nosec G117 -- Emitting credential_process JSON to stdout is the CLI's primary contract with AWS tooling.
 	return json.Marshal(p)
 }

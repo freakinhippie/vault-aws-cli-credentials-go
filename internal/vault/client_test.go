@@ -2,8 +2,17 @@ package vault
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"io"
+	"math/big"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -135,5 +144,97 @@ func TestClientGetAWSCredentialsMissingKeys(t *testing.T) {
 	if got := err.Error(); !strings.Contains(got, "missing access_key") {
 		t.Fatalf("unexpected error: %v", err)
 	}
+}
 
+func TestNewTLSConfigSkipVerifyDefaultsOff(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := newTLSConfig("", "", false)
+	if err != nil {
+		t.Fatalf("new TLS config: %v", err)
+	}
+	if cfg.InsecureSkipVerify {
+		t.Fatal("expected InsecureSkipVerify to default to false")
+	}
+	if cfg.MinVersion != tls.VersionTLS12 {
+		t.Fatalf("unexpected minimum TLS version: %v", cfg.MinVersion)
+	}
+}
+
+func TestNewTLSConfigSkipVerifyOptIn(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := newTLSConfig("", "", true)
+	if err != nil {
+		t.Fatalf("new TLS config: %v", err)
+	}
+	if !cfg.InsecureSkipVerify {
+		t.Fatal("expected InsecureSkipVerify when explicitly enabled")
+	}
+}
+
+func TestNewTLSConfigLoadsCertificatesFromCAPath(t *testing.T) {
+	t.Parallel()
+
+	certDir := t.TempDir()
+	rawSubject := writeTestCertificate(t, filepath.Join(certDir, "ca.pem"))
+
+	if err := os.WriteFile(filepath.Join(certDir, "ignored.txt"), []byte("not a cert"), 0o600); err != nil {
+		t.Fatalf("write ignored file: %v", err)
+	}
+
+	cfg, err := newTLSConfig("", certDir, false)
+	if err != nil {
+		t.Fatalf("new TLS config: %v", err)
+	}
+	if !subjectsContain(cfg.RootCAs.Subjects(), rawSubject) {
+		t.Fatal("expected certificate from VAULT_CAPATH to be added to the root pool")
+	}
+}
+
+func writeTestCertificate(t *testing.T, path string) []byte {
+	t.Helper()
+
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName:   "vaultcreds-test-ca",
+			Organization: []string{"vaultcreds"},
+		},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, template, template, pub, priv)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	if err := os.WriteFile(path, pemBytes, 0o600); err != nil {
+		t.Fatalf("write certificate: %v", err)
+	}
+
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse certificate: %v", err)
+	}
+	return cert.RawSubject
+}
+
+func subjectsContain(subjects [][]byte, want []byte) bool {
+	for _, subject := range subjects {
+		if string(subject) == string(want) {
+			return true
+		}
+	}
+	return false
 }

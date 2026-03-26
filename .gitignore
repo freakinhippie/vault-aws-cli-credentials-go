@@ -7,3 +7,4 @@
 
 # Go build/test caches
 .coverprofile
+gosec-report.json

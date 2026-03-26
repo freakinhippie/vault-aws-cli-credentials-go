@@ -77,6 +77,7 @@ func (s *Store) Save(key string, creds CachedCredentials) error {
 	if creds.AccessKeyID == "" || creds.SecretAccessKey == "" {
 		return errors.New("cache credentials missing access key or secret key")
 	}
+	// #nosec G117 -- Credentials are serialized only for storage in the secure OS keyring backend, not plaintext disk.
 	b, err := json.Marshal(creds)
 	if err != nil {
 		return fmt.Errorf("encode cached credentials: %w", err)

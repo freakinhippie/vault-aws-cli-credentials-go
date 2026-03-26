@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 )
@@ -134,6 +133,7 @@ func newTLSConfig(caCertPath, caPath string, skipVerify bool) (*tls.Config, erro
 	}
 
 	if caCertPath != "" {
+		// #nosec G304 -- VAULT_CACERT is an explicit user-selected file path that this CLI is expected to read as provided.
 		pem, err := os.ReadFile(caCertPath)
 		if err != nil {
 			return nil, fmt.Errorf("read VAULT_CACERT: %w", err)
@@ -144,6 +144,12 @@ func newTLSConfig(caCertPath, caPath string, skipVerify bool) (*tls.Config, erro
 	}
 
 	if caPath != "" {
+		root, err := os.OpenRoot(caPath)
+		if err != nil {
+			return nil, fmt.Errorf("open VAULT_CAPATH: %w", err)
+		}
+		defer root.Close()
+
 		entries, err := os.ReadDir(caPath)
 		if err != nil {
 			return nil, fmt.Errorf("read VAULT_CAPATH: %w", err)
@@ -152,7 +158,7 @@ func newTLSConfig(caCertPath, caPath string, skipVerify bool) (*tls.Config, erro
 			if entry.IsDir() {
 				continue
 			}
-			pem, err := os.ReadFile(filepath.Join(caPath, entry.Name()))
+			pem, err := root.ReadFile(entry.Name())
 			if err != nil {
 				continue
 			}
@@ -161,7 +167,8 @@ func newTLSConfig(caCertPath, caPath string, skipVerify bool) (*tls.Config, erro
 	}
 
 	return &tls.Config{
-		RootCAs:            pool,
+		RootCAs: pool,
+		// #nosec G402 -- VAULT_SKIP_VERIFY intentionally mirrors the Vault CLI and is disabled unless the user opts in.
 		InsecureSkipVerify: skipVerify,
 		MinVersion:         tls.VersionTLS12,
 	}, nil
