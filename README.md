@@ -38,18 +38,18 @@ Configuration precedence is:
 3. Config file (`--config` or `VAULTCREDS_CONFIG`)
 4. Defaults
 
-| Flag | Environment | Description |
-| :-- | :-- | :-- |
-| `-c`, `--config` | `VAULTCREDS_CONFIG` | Configuration file path |
-| `-V`, `--vault-addr` | `VAULT_ADDR` | Vault server URL |
-| `-C`, `--vault-cacert` | `VAULT_CACERT` | Vault CA certificate file |
-| `--vault-capath` | `VAULT_CAPATH` | Vault CA certificates directory |
-| `-m`, `--mount` | `VAULTCREDS_MOUNT` | AWS secrets backend mount (default `aws`) |
-| `-r`, `--role` | `VAULTCREDS_ROLE` | Vault role |
-| `-t`, `--ttl` | `VAULTCREDS_TTL` | Requested credential TTL (default `1h`) |
-| `-T`, `--type` | `VAULTCREDS_CREDENTIAL_TYPE` | Credential type: `sts` or `creds` (default `sts`) |
-| `--cache` | `VAULTCREDS_CACHE_CREDENTIALS` | Enable secure credential caching |
-| `--validate-config` | N/A | Validate config and exit |
+| Flag                   | Environment                    | Description                                       |
+| :--------------------- | :----------------------------- | :------------------------------------------------ |
+| `-c`, `--config`       | `VAULTCREDS_CONFIG`            | Configuration file path                           |
+| `-V`, `--vault-addr`   | `VAULT_ADDR`                   | Vault server URL                                  |
+| `-C`, `--vault-cacert` | `VAULT_CACERT`                 | Vault CA certificate file                         |
+| `--vault-capath`       | `VAULT_CAPATH`                 | Vault CA certificates directory                   |
+| `-m`, `--mount`        | `VAULTCREDS_MOUNT`             | AWS secrets backend mount (default `aws`)         |
+| `-r`, `--role`         | `VAULTCREDS_ROLE`              | Vault role                                        |
+| `-t`, `--ttl`          | `VAULTCREDS_TTL`               | Requested credential TTL (default `1h`)           |
+| `-T`, `--type`         | `VAULTCREDS_CREDENTIAL_TYPE`   | Credential type: `sts` or `creds` (default `sts`) |
+| `--cache`              | `VAULTCREDS_CACHE_CREDENTIALS` | Enable secure credential caching                  |
+| `--validate-config`    | N/A                            | Validate config and exit                          |
 
 Additional Vault variables honored:
 

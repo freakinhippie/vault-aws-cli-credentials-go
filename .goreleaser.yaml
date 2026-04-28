@@ -5,10 +5,6 @@ project_name: vaultcreds
 snapshot:
   version_template: "{{ if .Env.VERSION }}{{ .Env.VERSION }}{{ else }}{{ .Version }}{{ end }}-SNAPSHOT"
 
-before:
-  hooks:
-    - go mod tidy
-
 builds:
   - id: vaultcreds-linux
     main: ./cmd/vaultcreds
@@ -46,6 +42,12 @@ builds:
       - arm64
     ldflags:
       - -s -w -X main.version={{.Version}}
+    hooks:
+      post:
+        - >-
+          codesign --force --timestamp --options runtime
+          --sign "{{ .Env.APPLE_CODESIGN_IDENTITY }}"
+          "{{ .Path }}"
 
 archives:
   - id: vaultcreds-archives
@@ -57,6 +59,9 @@ archives:
       - tar.gz
     format_overrides:
       - goos: windows
+        formats:
+          - zip
+      - goos: darwin
         formats:
           - zip
     name_template: >-
@@ -99,27 +104,6 @@ homebrew_casks:
     homepage: "https://github.com/freakinhippie/vault-aws-cli-credentials-go"
     description: "Vault AWS CLI/SDK external credential process helper"
     license: "Apache-2.0"
-
-chocolateys:
-  - name: vaultcreds
-    ids:
-      - vaultcreds-archives
-    title: "Vault AWS CLI/SDK Credentials Helper"
-    authors: "Vault AWS Credentials Helper Maintainers"
-    project_url: "https://github.com/freakinhippie/vault-aws-cli-credentials-go"
-    url_template: "https://github.com/freakinhippie/vault-aws-cli-credentials-go/releases/download/{{ .Tag }}/{{ .ArtifactName }}"
-    icon_url: "https://raw.githubusercontent.com/freakinhippie/vault-aws-cli-credentials-go/main/.github/assets/vaultcreds-icon.png"
-    license_url: "https://github.com/freakinhippie/vault-aws-cli-credentials-go/blob/main/LICENSE"
-    require_license_acceptance: false
-    project_source_url: "https://github.com/freakinhippie/vault-aws-cli-credentials-go"
-    docs_url: "https://github.com/freakinhippie/vault-aws-cli-credentials-go#readme"
-    bug_tracker_url: "https://github.com/freakinhippie/vault-aws-cli-credentials-go/issues"
-    tags: "vault aws credentials"
-    summary: "Vault AWS CLI/SDK external credential process helper"
-    description: "Fetches short-lived AWS credentials from Vault/OpenBao for use with AWS credential_process."
-    release_notes: "https://github.com/freakinhippie/vault-aws-cli-credentials-go/releases/tag/{{ .Tag }}"
-    source_repo: "https://push.chocolatey.org/"
-    api_key: "{{ .Env.CHOCOLATEY_API_KEY }}"
 
 changelog:
   use: git
