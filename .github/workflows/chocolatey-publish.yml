@@ -30,7 +30,7 @@ jobs:
           } else {
             $tag = "${{ inputs.tag }}"
           }
-          if (-not $tag -or $tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+') {
+          if (-not $tag -or $tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
             throw "Tag must match vX.Y.Z"
           }
           $version = $tag.TrimStart('v')
