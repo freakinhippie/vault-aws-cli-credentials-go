@@ -36,10 +36,10 @@ jobs:
         env:
           APPLE_DEVELOPER_ID_CERT_P12_B64: ${{ secrets.APPLE_DEVELOPER_ID_CERT_P12_B64 }}
           APPLE_DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD }}
-          APPLE_TEAM_ID: ${{ env.APPLE_TEAM_ID }}
-          APPLE_CODESIGN_IDENTITY: ${{ env.APPLE_CODESIGN_IDENTITY }}
-          APPLE_NOTARY_KEY_ID: ${{ env.APPLE_NOTARY_KEY_ID }}
-          APPLE_NOTARY_ISSUER_ID: ${{ env.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_CODESIGN_IDENTITY: ${{ vars.APPLE_CODESIGN_IDENTITY }}
+          APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
           APPLE_NOTARY_API_KEY_P8_B64: ${{ secrets.APPLE_NOTARY_API_KEY_P8_B64 }}
         run: |
           set -euo pipefail
@@ -95,7 +95,7 @@ jobs:
 
       - name: Setup notary API key file
         env:
-          APPLE_NOTARY_KEY_ID: ${{ env.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
           APPLE_NOTARY_API_KEY_P8_B64: ${{ secrets.APPLE_NOTARY_API_KEY_P8_B64 }}
         run: |
           set -euo pipefail
@@ -106,15 +106,15 @@ jobs:
 
       - name: Build signed snapshot artifacts (no publish)
         env:
-          APPLE_CODESIGN_IDENTITY: ${{ env.APPLE_CODESIGN_IDENTITY }}
+          APPLE_CODESIGN_IDENTITY: ${{ vars.APPLE_CODESIGN_IDENTITY }}
         run: goreleaser release --snapshot --clean --skip=publish --skip=announce --skip=chocolatey
 
       - name: Notarize Darwin archives
         env:
-          APPLE_TEAM_ID: ${{ env.APPLE_TEAM_ID }}
-          APPLE_NOTARY_KEY_ID: ${{ env.APPLE_NOTARY_KEY_ID }}
-          APPLE_NOTARY_ISSUER_ID: ${{ env.APPLE_NOTARY_ISSUER_ID }}
-          APPLE_NOTARY_KEY_PATH: ${{ env.APPLE_NOTARY_KEY_PATH }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_NOTARY_KEY_PATH: ${{ vars.APPLE_NOTARY_KEY_PATH }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -137,7 +137,7 @@ jobs:
       - name: Cleanup temporary keychain and build artifacts
         if: always()
         env:
-          APPLE_KEYCHAIN_PATH: ${{ env.APPLE_KEYCHAIN_PATH }}
+          APPLE_KEYCHAIN_PATH: ${{ vars.APPLE_KEYCHAIN_PATH }}
         run: |
           set -euo pipefail
           if [ -n "${APPLE_KEYCHAIN_PATH:-}" ] && [ -f "$APPLE_KEYCHAIN_PATH" ]; then
