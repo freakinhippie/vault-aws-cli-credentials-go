@@ -153,6 +153,42 @@ func TestRunHelp(t *testing.T) {
 	}
 }
 
+func TestRunVersion(t *testing.T) {
+	tokenResolverCalled := false
+	vaultClientCalled := false
+	cacheStoreCalled := false
+	deps := runDeps{
+		newTokenResolver: func() tokenResolver {
+			tokenResolverCalled = true
+			return fakeTokenResolver{}
+		},
+		newVaultClient: func(cfg vault.ClientConfig) (vaultClient, error) {
+			vaultClientCalled = true
+			return fakeVaultClient{}, nil
+		},
+		newCacheStore: func() (credentialCache, error) {
+			cacheStoreCalled = true
+			return &fakeCacheStore{}, nil
+		},
+	}
+
+	var stdout strings.Builder
+	var stderr strings.Builder
+	exit := runWithDeps([]string{"--version"}, nil, &stdout, &stderr, deps)
+	if exit != 0 {
+		t.Fatalf("expected exit 0, got %d", exit)
+	}
+	if strings.TrimSpace(stdout.String()) != version {
+		t.Fatalf("unexpected stdout: %q", stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("unexpected stderr: %q", stderr.String())
+	}
+	if tokenResolverCalled || vaultClientCalled || cacheStoreCalled {
+		t.Fatalf("version mode should not resolve token or talk to vault/cache")
+	}
+}
+
 func TestRunCacheHitSkipsVault(t *testing.T) {
 	t.Parallel()
 

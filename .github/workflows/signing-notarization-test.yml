@@ -93,6 +93,19 @@ jobs:
             echo "APPLE_KEYCHAIN_PASSWORD=$KEYCHAIN_PASSWORD"
           } >> "$GITHUB_ENV"
 
+      - name: Verify imported code-signing identity
+        env:
+          APPLE_CODESIGN_IDENTITY: ${{ vars.APPLE_CODESIGN_IDENTITY }}
+          APPLE_KEYCHAIN_PATH: ${{ env.APPLE_KEYCHAIN_PATH }}
+        run: |
+          set -euo pipefail
+          echo "Configured APPLE_CODESIGN_IDENTITY: '$APPLE_CODESIGN_IDENTITY'"
+          security find-identity -v -p codesigning "$APPLE_KEYCHAIN_PATH"
+          if ! security find-identity -v -p codesigning "$APPLE_KEYCHAIN_PATH" | grep -F "\"$APPLE_CODESIGN_IDENTITY\""; then
+            echo "Configured APPLE_CODESIGN_IDENTITY was not found in imported keychain identities." >&2
+            exit 1
+          fi
+
       - name: Setup notary API key file
         env:
           APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
@@ -117,6 +130,10 @@ jobs:
           APPLE_NOTARY_KEY_PATH: ${{ vars.APPLE_NOTARY_KEY_PATH }}
         run: |
           set -euo pipefail
+          if [ -z "${APPLE_NOTARY_KEY_PATH:-}" ] || [ ! -f "$APPLE_NOTARY_KEY_PATH" ]; then
+            echo "Missing notary API key file at APPLE_NOTARY_KEY_PATH: ${APPLE_NOTARY_KEY_PATH:-<unset>}" >&2
+            exit 1
+          fi
           shopt -s nullglob
           files=(dist/*_darwin_*.zip)
           if [ "${#files[@]}" -eq 0 ]; then
@@ -137,7 +154,7 @@ jobs:
       - name: Cleanup temporary keychain and build artifacts
         if: always()
         env:
-          APPLE_KEYCHAIN_PATH: ${{ vars.APPLE_KEYCHAIN_PATH }}
+          APPLE_KEYCHAIN_PATH: ${{ env.APPLE_KEYCHAIN_PATH }}
         run: |
           set -euo pipefail
           if [ -n "${APPLE_KEYCHAIN_PATH:-}" ] && [ -f "$APPLE_KEYCHAIN_PATH" ]; then

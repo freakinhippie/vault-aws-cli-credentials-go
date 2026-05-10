@@ -77,6 +77,10 @@ func runWithDeps(args []string, environ []string, stdout, stderr io.Writer, deps
 		return 2
 	}
 
+	if cfg.ShowVersion {
+		_, _ = fmt.Fprintln(stdout, version)
+		return 0
+	}
 	if cfg.ValidateOnly {
 		_, _ = fmt.Fprintln(stdout, "configuration is valid")
 		return 0

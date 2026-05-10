@@ -150,3 +150,15 @@ func TestLoadCachePurgeCSV(t *testing.T) {
 		t.Fatalf("expected 3 keys, got %#v", cfg.CachePurgeKeys)
 	}
 }
+
+func TestLoadVersionDoesNotRequireVaultSettings(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := Load([]string{"--version"}, nil)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if !cfg.ShowVersion {
+		t.Fatal("expected version mode")
+	}
+}

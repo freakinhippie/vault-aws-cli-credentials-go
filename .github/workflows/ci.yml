@@ -82,16 +82,28 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Resolve build version
+        id: version
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" =~ ^v ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="0.0.0-${GITHUB_SHA::12}"
+          fi
+          echo "value=${version}" >> "$GITHUB_OUTPUT"
+
       - name: Build target binary
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: ${{ matrix.cgo_enabled }}
+          VERSION: ${{ steps.version.outputs.value }}
         run: |
           mkdir -p dist
           ext=""
           if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
-          go build -o "dist/vaultcreds_${GOOS}_${GOARCH}${ext}" ./cmd/vaultcreds
+          go build -ldflags "-s -w -X main.version=${VERSION}" -o "dist/vaultcreds_${GOOS}_${GOARCH}${ext}" ./cmd/vaultcreds
 
   goreleaser-dry-run:
     runs-on: ubuntu-latest
@@ -208,6 +220,19 @@ jobs:
             echo "APPLE_KEYCHAIN_PASSWORD=$KEYCHAIN_PASSWORD"
           } >> "$GITHUB_ENV"
 
+      - name: Verify imported code-signing identity
+        env:
+          APPLE_CODESIGN_IDENTITY: ${{ vars.APPLE_CODESIGN_IDENTITY }}
+          APPLE_KEYCHAIN_PATH: ${{ env.APPLE_KEYCHAIN_PATH }}
+        run: |
+          set -euo pipefail
+          echo "Configured APPLE_CODESIGN_IDENTITY: '$APPLE_CODESIGN_IDENTITY'"
+          security find-identity -v -p codesigning "$APPLE_KEYCHAIN_PATH"
+          if ! security find-identity -v -p codesigning "$APPLE_KEYCHAIN_PATH" | grep -F "\"$APPLE_CODESIGN_IDENTITY\""; then
+            echo "Configured APPLE_CODESIGN_IDENTITY was not found in imported keychain identities." >&2
+            exit 1
+          fi
+
       - name: Setup notary API key file
         env:
           APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
@@ -231,9 +256,13 @@ jobs:
           APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
           APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
           APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
-          APPLE_NOTARY_KEY_PATH: ${{ vars.APPLE_NOTARY_KEY_PATH }}
+          APPLE_NOTARY_KEY_PATH: ${{ env.APPLE_NOTARY_KEY_PATH }}
         run: |
           set -euo pipefail
+          if [ -z "${APPLE_NOTARY_KEY_PATH:-}" ] || [ ! -f "$APPLE_NOTARY_KEY_PATH" ]; then
+            echo "Missing notary API key file at APPLE_NOTARY_KEY_PATH: ${APPLE_NOTARY_KEY_PATH:-<unset>}" >&2
+            exit 1
+          fi
           shopt -s nullglob
           files=(dist/*_darwin_*.zip)
           if [ "${#files[@]}" -eq 0 ]; then
@@ -254,7 +283,7 @@ jobs:
       - name: Cleanup temporary keychain
         if: always()
         env:
-          APPLE_KEYCHAIN_PATH: ${{ vars.APPLE_KEYCHAIN_PATH }}
+          APPLE_KEYCHAIN_PATH: ${{ env.APPLE_KEYCHAIN_PATH }}
         run: |
           set -euo pipefail
           if [ -n "${APPLE_KEYCHAIN_PATH:-}" ] && [ -f "$APPLE_KEYCHAIN_PATH" ]; then
