@@ -46,6 +46,7 @@ Flags:
       --cache-purge-all      Purge all cache entries
       --cache-keyring-recovery-help  Show OS-specific keyring reset/recovery guidance
       --validate-config      Validate configuration and exit
+      --version              Show version and exit
   -h, --help                 Show help
 
 Additional Vault env vars:
@@ -80,6 +81,7 @@ type Config struct {
 	CachePurgeAll            bool
 	CacheKeyringRecoveryHelp bool
 	ValidateOnly             bool
+	ShowVersion              bool
 }
 
 type fileConfig struct {
@@ -136,6 +138,7 @@ func Load(args []string, environ []string) (Config, error) {
 		flagCachePurgeAll            bool
 		flagCacheKeyringRecoveryHelp bool
 		flagValidateConfig           bool
+		flagVersion                  bool
 	)
 
 	fs := flag.NewFlagSet("vaultcreds", flag.ContinueOnError)
@@ -162,6 +165,7 @@ func Load(args []string, environ []string) (Config, error) {
 	fs.BoolVar(&flagCachePurgeAll, "cache-purge-all", false, "Purge all cache entries")
 	fs.BoolVar(&flagCacheKeyringRecoveryHelp, "cache-keyring-recovery-help", false, "Show OS-specific keyring reset/recovery guidance")
 	fs.BoolVar(&flagValidateConfig, "validate-config", false, "Validate configuration and exit")
+	fs.BoolVar(&flagVersion, "version", false, "Show version and exit")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -224,6 +228,9 @@ func Load(args []string, environ []string) (Config, error) {
 	if seen["validate-config"] {
 		cfg.ValidateOnly = flagValidateConfig
 	}
+	if seen["version"] {
+		cfg.ShowVersion = flagVersion
+	}
 
 	if err := validate(cfg); err != nil {
 		return Config{}, err
@@ -233,6 +240,9 @@ func Load(args []string, environ []string) (Config, error) {
 }
 
 func validate(cfg Config) error {
+	if cfg.ShowVersion {
+		return nil
+	}
 	if cfg.IsCacheMaintenanceMode() {
 		return validateCacheMaintenance(cfg)
 	}

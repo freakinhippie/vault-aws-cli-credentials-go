@@ -50,6 +50,7 @@ Configuration precedence is:
 | `-T`, `--type`         | `VAULTCREDS_CREDENTIAL_TYPE`   | Credential type: `sts` or `creds` (default `sts`) |
 | `--cache`              | `VAULTCREDS_CACHE_CREDENTIALS` | Enable secure credential caching                  |
 | `--validate-config`    | N/A                            | Validate config and exit                          |
+| `--version`            | N/A                            | Show version and exit                             |
 
 Additional Vault variables honored:
 
