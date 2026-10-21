@@ -1,8 +1,6 @@
 module github.com/freakinhippie/vault-aws-cli-credentials-go
 
-go 1.25
-
-toolchain go1.25.7
+go 1.27.3
 
 require github.com/byteness/keyring v1.3.6
 
