@@ -6,7 +6,11 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/freakinhippie/vault-aws-cli-credentials-go/internal/kv"
 )
+
+const bom = "\ufeff"
 
 func parseConfigFile(path string) (fileConfig, error) {
 	// #nosec G304 -- The config file path is explicitly selected by the user via flag or environment variable.
@@ -17,24 +21,33 @@ func parseConfigFile(path string) (fileConfig, error) {
 	defer f.Close()
 
 	var cfg fileConfig
+	seenKeys := map[string]int{}
 	scanner := bufio.NewScanner(f)
 	lineNo := 0
+	first := true
 	for scanner.Scan() {
 		lineNo++
-		line := strings.TrimSpace(scanner.Text())
+		line := scanner.Text()
+		if first {
+			line = strings.TrimPrefix(line, bom)
+			first = false
+		}
+		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-
-		keyPart, valuePart, ok := strings.Cut(line, "=")
-		if !ok {
-			return fileConfig{}, fmt.Errorf("config parse error at %s:%d", path, lineNo)
+		if strings.HasPrefix(line, "[") {
+			return fileConfig{}, fmt.Errorf("config parse error at %s:%d: unsupported section header %q, use top-level \"key = value\" entries", path, lineNo, line)
 		}
 
-		key := normalizeKey(keyPart)
-		value := strings.TrimSpace(valuePart)
-		value = trimInlineComment(value)
-		value = stripQuotes(value)
+		key, value, ok := kv.SplitKeyValue(line)
+		if !ok {
+			return fileConfig{}, fmt.Errorf("config parse error at %s:%d: expected \"key = value\"", path, lineNo)
+		}
+		if prev, dup := seenKeys[key]; dup {
+			return fileConfig{}, fmt.Errorf("config parse error at %s:%d: duplicate key %q (first defined on line %d)", path, lineNo, key, prev)
+		}
+		seenKeys[key] = lineNo
 
 		switch key {
 		case "vault_addr":
@@ -52,7 +65,7 @@ func parseConfigFile(path string) (fileConfig, error) {
 		case "vault_skip_verify":
 			parsed, err := strconv.ParseBool(value)
 			if err != nil {
-				return fileConfig{}, fmt.Errorf("invalid boolean at %s:%d", path, lineNo)
+				return fileConfig{}, fmt.Errorf("invalid boolean for %q at %s:%d", key, path, lineNo)
 			}
 			cfg.VaultSkipVerify = &parsed
 		case "mount":
@@ -63,12 +76,16 @@ func parseConfigFile(path string) (fileConfig, error) {
 			cfg.TTL = value
 		case "credential_type", "type":
 			cfg.CredentialType = value
+		case "cache_keyctl_scope":
+			cfg.CacheKeyctlScope = value
 		case "cache", "cache_credentials":
 			parsed, err := strconv.ParseBool(value)
 			if err != nil {
-				return fileConfig{}, fmt.Errorf("invalid boolean at %s:%d", path, lineNo)
+				return fileConfig{}, fmt.Errorf("invalid boolean for %q at %s:%d", key, path, lineNo)
 			}
 			cfg.CacheCredentials = &parsed
+		default:
+			return fileConfig{}, fmt.Errorf("unknown config key %q at %s:%d", key, path, lineNo)
 		}
 	}
 
@@ -76,41 +93,4 @@ func parseConfigFile(path string) (fileConfig, error) {
 		return fileConfig{}, fmt.Errorf("read config file: %w", err)
 	}
 	return cfg, nil
-}
-
-func normalizeKey(v string) string {
-	n := strings.TrimSpace(strings.ToLower(v))
-	n = strings.ReplaceAll(n, "-", "_")
-	return n
-}
-
-func trimInlineComment(v string) string {
-	inSingle := false
-	inDouble := false
-	for i := 0; i < len(v); i++ {
-		switch v[i] {
-		case '\'':
-			if !inDouble {
-				inSingle = !inSingle
-			}
-		case '"':
-			if !inSingle {
-				inDouble = !inDouble
-			}
-		case '#':
-			if !inSingle && !inDouble {
-				return strings.TrimSpace(v[:i])
-			}
-		}
-	}
-	return strings.TrimSpace(v)
-}
-
-func stripQuotes(v string) string {
-	if len(v) >= 2 {
-		if (v[0] == '"' && v[len(v)-1] == '"') || (v[0] == '\'' && v[len(v)-1] == '\'') {
-			return v[1 : len(v)-1]
-		}
-	}
-	return v
 }

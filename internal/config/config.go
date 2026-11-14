@@ -5,8 +5,14 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
+	"math/big"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var ErrHelpRequested = errors.New("help requested")
@@ -15,7 +21,12 @@ const (
 	defaultMount          = "aws"
 	defaultCredentialType = "sts"
 	defaultTTL            = "1h"
+	defaultClientTimeout  = 60 * time.Second
 )
+
+// ttlUnitPattern accepts Vault-style durations composed of one or more
+// numeric+unit segments, e.g. "90s", "1h", "1.5h", "1h30m", "1d12h", "1w".
+var ttlUnitPattern = regexp.MustCompile(`\d+(?:\.\d+)?[smhdw]`)
 
 func HelpText(binaryPath string) string {
 	if strings.TrimSpace(binaryPath) == "" {
@@ -45,16 +56,18 @@ Flags:
       --cache-purge-expired  Purge expired cache entries
       --cache-purge-all      Purge all cache entries
       --cache-keyring-recovery-help  Show OS-specific keyring reset/recovery guidance
+      --cache-keyctl-scope string    Linux kernel keyring scope (env: VAULTCREDS_CACHE_KEYCTL_SCOPE, default: session)
       --validate-config      Validate configuration and exit
       --version              Show version and exit
   -h, --help                 Show help
 
 Additional Vault env vars:
-  VAULT_TOKEN, VAULT_TOKEN_HELPER, VAULT_NAMESPACE, VAULT_SKIP_VERIFY
+  VAULT_TOKEN, VAULT_TOKEN_HELPER, VAULT_NAMESPACE, VAULT_SKIP_VERIFY,
+  VAULT_DISABLE_REDIRECTS, VAULT_CLIENT_TIMEOUT (seconds or Go duration, default 60s)
 
 Examples (AWS shared config):
-  credential_process = {{ .BinaryPath }} --vault-addr=https://vault.example.com --role=dev-role
-  credential_process = {{ .BinaryPath }} --vault-addr=https://vault.example.com --mount=aws-team --role=app-role --type=creds
+  credential_process = {{ .BinaryPath }} --vault-addr=https://vault.example.com:8200 --role=dev-role
+  credential_process = {{ .BinaryPath }} --vault-addr=https://vault.example.com:8200 --mount=aws-team --role=app-role --type=creds
   credential_process = {{ .BinaryPath }} --config=/etc/vaultcreds/config.toml
 `)
 	text = strings.ReplaceAll(text, "{{ .BinaryPath }}", binaryPath)
@@ -70,10 +83,13 @@ type Config struct {
 	VaultToken               string
 	VaultTokenHelper         string
 	VaultSkipVerify          bool
+	VaultDisableRedirects    bool
+	CacheKeyctlScope         string
 	Mount                    string
 	Role                     string
 	TTL                      string
 	CredentialType           string
+	ClientTimeout            time.Duration
 	CacheCredentials         bool
 	CacheList                bool
 	CachePurgeKeys           []string
@@ -97,32 +113,19 @@ type fileConfig struct {
 	TTL              string
 	CredentialType   string
 	CacheCredentials *bool
+	CacheKeyctlScope string
 }
 
+// Load resolves configuration with a strict precedence of CLI flag >
+// environment variable > config file > built-in default. Flags are parsed
+// first so every spelling the Go flag package accepts (-c v, -c=v, --config v,
+// --config=v, -config=v, ...) resolves the same config file that is then
+// actually loaded.
 func Load(args []string, environ []string) (Config, error) {
 	env := envMap(environ)
-	cfg := Config{
-		ConfigPath:     env["VAULTCREDS_CONFIG"],
-		Mount:          defaultMount,
-		CredentialType: defaultCredentialType,
-		TTL:            defaultTTL,
-	}
-
-	if path, ok := findConfigPathArg(args); ok {
-		cfg.ConfigPath = path
-	}
-
-	if cfg.ConfigPath != "" {
-		fc, err := parseConfigFile(cfg.ConfigPath)
-		if err != nil {
-			return Config{}, err
-		}
-		applyFileConfig(&cfg, fc)
-	}
-
-	applyEnvConfig(&cfg, env)
 
 	var (
+		flagCacheKeyctlScope         string
 		flagConfigPath               string
 		flagVaultAddr                string
 		flagVaultCACert              string
@@ -159,6 +162,7 @@ func Load(args []string, environ []string) (Config, error) {
 	fs.StringVar(&flagType, "T", "", "Credential type (sts or creds)")
 	fs.StringVar(&flagType, "type", "", "Credential type (sts or creds)")
 	fs.BoolVar(&flagCache, "cache", false, "Cache credentials in secure storage")
+	fs.StringVar(&flagCacheKeyctlScope, "cache-keyctl-scope", "", "Linux kernel keyring scope")
 	fs.BoolVar(&flagCacheList, "cache-list", false, "List cache entries")
 	fs.StringVar(&flagCachePurge, "cache-purge", "", "Purge comma-separated cache key(s)")
 	fs.BoolVar(&flagCachePurgeExpired, "cache-purge-expired", false, "Purge expired cache entries")
@@ -183,60 +187,171 @@ func Load(args []string, environ []string) (Config, error) {
 		seen[f.Name] = true
 	})
 
-	if seen["c"] || seen["config"] {
+	flagConfigSeen := seen["c"] || seen["config"]
+	if flagConfigSeen && strings.TrimSpace(flagConfigPath) == "" {
+		return Config{}, errors.New("--config requires a non-empty file path")
+	}
+	if seen["cache-purge"] && len(splitCSV(flagCachePurge)) == 0 {
+		return Config{}, errors.New("--cache-purge requires at least one cache key")
+	}
+
+	cacheMaintenanceRequested := flagCacheList || flagCachePurgeExpired || flagCachePurgeAll ||
+		flagCacheKeyringRecoveryHelp || seen["cache-purge"]
+
+	cfg := Config{
+		Mount:                    defaultMount,
+		CredentialType:           defaultCredentialType,
+		TTL:                      defaultTTL,
+		ClientTimeout:            defaultClientTimeout,
+		CacheKeyringRecoveryHelp: flagCacheKeyringRecoveryHelp,
+		CacheKeyctlScope:         "session",
+		CacheList:                flagCacheList,
+		CachePurgeKeys:           splitCSV(flagCachePurge),
+		CachePurgeExpired:        flagCachePurgeExpired,
+		CachePurgeAll:            flagCachePurgeAll,
+		ValidateOnly:             flagValidateConfig,
+		ShowVersion:              flagVersion,
+	}
+
+	// Version and recovery help have no dependency on credential settings.
+	if cfg.ShowVersion || cfg.CacheKeyringRecoveryHelp {
+		return cfg, validate(cfg)
+	}
+	// Cache maintenance ignores the credential config file and Vault environment.
+	// The scope still selects the kernel keyring that maintenance should operate on.
+	if cacheMaintenanceRequested {
+		cfg.CacheKeyctlScope = firstSeen(flagCacheKeyctlScope, seen, "cache-keyctl-scope", "", env, "VAULTCREDS_CACHE_KEYCTL_SCOPE", "", "session")
+		if err := validateKeyctlScope(cfg.CacheKeyctlScope); err != nil {
+			return Config{}, err
+		}
+		return cfg, validate(cfg)
+	}
+
+	// Resolve the effective config path (flag > env) before loading the file.
+	if flagConfigSeen {
 		cfg.ConfigPath = flagConfigPath
+	} else if env["VAULTCREDS_CONFIG"] != "" {
+		cfg.ConfigPath = env["VAULTCREDS_CONFIG"]
 	}
-	if seen["V"] || seen["vault-addr"] {
-		cfg.VaultAddr = flagVaultAddr
+
+	var fc fileConfig
+	if cfg.ConfigPath != "" {
+		expanded, err := expandHome(cfg.ConfigPath)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.ConfigPath = expanded
+		fc, err = parseConfigFile(cfg.ConfigPath)
+		if err != nil {
+			return Config{}, err
+		}
 	}
-	if seen["C"] || seen["vault-cacert"] {
-		cfg.VaultCACert = flagVaultCACert
+
+	// Merge scalar settings with flag > env > file > default precedence.
+	cfg.CacheKeyctlScope = firstSeen(flagCacheKeyctlScope, seen, "cache-keyctl-scope", "", env, "VAULTCREDS_CACHE_KEYCTL_SCOPE", fc.CacheKeyctlScope, "session")
+	cfg.VaultAddr = firstSeen(flagVaultAddr, seen, "V", "vault-addr", env, "VAULT_ADDR", fc.VaultAddr, "")
+	cfg.Role = firstSeen(flagRole, seen, "r", "role", env, "VAULTCREDS_ROLE", fc.Role, "")
+	cfg.Mount = firstSeen(flagMount, seen, "m", "mount", env, "VAULTCREDS_MOUNT", fc.Mount, defaultMount)
+	cfg.TTL = firstSeen(flagTTL, seen, "t", "ttl", env, "VAULTCREDS_TTL", fc.TTL, defaultTTL)
+	cfg.CredentialType = firstSeen(flagType, seen, "T", "type", env, "VAULTCREDS_CREDENTIAL_TYPE", fc.CredentialType, defaultCredentialType)
+	cfg.VaultNamespace = envOrFile(env, "VAULT_NAMESPACE", fc.VaultNamespace)
+	cfg.VaultToken = envOrFile(env, "VAULT_TOKEN", fc.VaultToken)
+	cfg.VaultTokenHelper = envOrFile(env, "VAULT_TOKEN_HELPER", fc.VaultTokenHelper)
+	if v := firstSeen(flagVaultCACert, seen, "C", "vault-cacert", env, "VAULT_CACERT", fc.VaultCACert, ""); v != "" {
+		expanded, err := expandHome(v)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.VaultCACert = expanded
 	}
-	if seen["vault-capath"] {
-		cfg.VaultCAPath = flagVaultCAPath
+	if v := firstSeen(flagVaultCAPath, seen, "vault-capath", "vault-capath", env, "VAULT_CAPATH", fc.VaultCAPath, ""); v != "" {
+		expanded, err := expandHome(v)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.VaultCAPath = expanded
 	}
-	if seen["m"] || seen["mount"] {
-		cfg.Mount = flagMount
+
+	envBool := func(envKey string, fileVal *bool) (bool, error) {
+		if v := env[envKey]; v != "" {
+			parsed, err := strconv.ParseBool(v)
+			if err != nil {
+				return false, fmt.Errorf("invalid boolean in %s: %q", envKey, v)
+			}
+			return parsed, nil
+		}
+		if fileVal != nil {
+			return *fileVal, nil
+		}
+		return false, nil
 	}
-	if seen["r"] || seen["role"] {
-		cfg.Role = flagRole
+
+	var err error
+	if cfg.VaultSkipVerify, err = envBool("VAULT_SKIP_VERIFY", fc.VaultSkipVerify); err != nil {
+		return Config{}, err
 	}
-	if seen["t"] || seen["ttl"] {
-		cfg.TTL = flagTTL
+	if cfg.VaultDisableRedirects, err = envBool("VAULT_DISABLE_REDIRECTS", nil); err != nil {
+		return Config{}, err
 	}
-	if seen["T"] || seen["type"] {
-		cfg.CredentialType = flagType
-	}
-	if seen["cache"] {
+	switch {
+	case seen["cache"]:
 		cfg.CacheCredentials = flagCache
+	default:
+		if cfg.CacheCredentials, err = envBool("VAULTCREDS_CACHE_CREDENTIALS", fc.CacheCredentials); err != nil {
+			return Config{}, err
+		}
 	}
-	if seen["cache-list"] {
-		cfg.CacheList = flagCacheList
+
+	if v := env["VAULT_CLIENT_TIMEOUT"]; v != "" {
+		timeout, err := parseClientTimeout(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("invalid VAULT_CLIENT_TIMEOUT: %w", err)
+		}
+		cfg.ClientTimeout = timeout
 	}
+
+	cfg.CacheList = flagCacheList
 	if seen["cache-purge"] {
 		cfg.CachePurgeKeys = splitCSV(flagCachePurge)
 	}
-	if seen["cache-purge-expired"] {
-		cfg.CachePurgeExpired = flagCachePurgeExpired
-	}
-	if seen["cache-purge-all"] {
-		cfg.CachePurgeAll = flagCachePurgeAll
-	}
-	if seen["cache-keyring-recovery-help"] {
-		cfg.CacheKeyringRecoveryHelp = flagCacheKeyringRecoveryHelp
-	}
-	if seen["validate-config"] {
-		cfg.ValidateOnly = flagValidateConfig
-	}
-	if seen["version"] {
-		cfg.ShowVersion = flagVersion
-	}
+	cfg.CachePurgeExpired = flagCachePurgeExpired
+	cfg.CachePurgeAll = flagCachePurgeAll
+	cfg.ValidateOnly = flagValidateConfig
+	cfg.ShowVersion = flagVersion
 
+	cfg.TTL, err = normalizeTTL(cfg.TTL)
+	if err != nil {
+		return Config{}, err
+	}
 	if err := validate(cfg); err != nil {
 		return Config{}, err
 	}
 
 	return cfg, nil
+}
+
+// firstSeen returns the flag value when either of its names was provided,
+// otherwise the environment value, otherwise the config-file value,
+// otherwise the given default.
+func firstSeen(flagVal string, seen map[string]bool, primaryName, aliasName string, env map[string]string, envKey, fileVal, def string) string {
+	if seen[primaryName] || (aliasName != "" && seen[aliasName]) {
+		return flagVal
+	}
+	if v := env[envKey]; v != "" {
+		return v
+	}
+	if fileVal != "" {
+		return fileVal
+	}
+	return def
+}
+
+// envOrFile resolves settings that have no CLI flag: env > file.
+func envOrFile(env map[string]string, envKey, fileVal string) string {
+	if v := env[envKey]; v != "" {
+		return v
+	}
+	return fileVal
 }
 
 func validate(cfg Config) error {
@@ -260,16 +375,14 @@ func validate(cfg Config) error {
 	if cfg.Mount == "" {
 		return errors.New("mount cannot be empty")
 	}
-	if cfg.TTL != "" {
-		if _, err := strconv.ParseInt(cfg.TTL, 10, 64); err == nil {
-			return nil
-		}
-		if _, err := strconv.ParseFloat(cfg.TTL, 64); err == nil {
-			return nil
-		}
-		if !isDurationLike(cfg.TTL) {
-			return fmt.Errorf("invalid ttl %q", cfg.TTL)
-		}
+	if err := validateTTL(cfg.TTL); err != nil {
+		return err
+	}
+	if err := validateKeyctlScope(cfg.CacheKeyctlScope); err != nil {
+		return err
+	}
+	if cfg.ClientTimeout < 0 {
+		return errors.New("client timeout must be positive")
 	}
 	return nil
 }
@@ -304,16 +417,100 @@ func (cfg Config) IsCacheMaintenanceMode() bool {
 	return cfg.CacheList || len(cfg.CachePurgeKeys) > 0 || cfg.CachePurgeExpired || cfg.CachePurgeAll || cfg.CacheKeyringRecoveryHelp
 }
 
-func isDurationLike(v string) bool {
-	if len(v) < 2 {
-		return false
+// normalizeTTL preserves Vault durations and converts the d/w extensions into
+// Go durations before transmission. Zero retains Vault's default-TTL semantics.
+func normalizeTTL(v string) (string, error) {
+	if v == "" {
+		return v, nil
 	}
-	unit := v[len(v)-1]
-	if strings.IndexByte("smhd", unit) == -1 {
-		return false
+	if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if n < 0 || n > math.MaxInt64/int64(time.Second) {
+			return "", fmt.Errorf("invalid ttl %q: duration out of range", v)
+		}
+		return v, nil
 	}
-	_, err := strconv.Atoi(v[:len(v)-1])
-	return err == nil
+	if !strings.ContainsAny(v, "dw") {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < 0 {
+			return "", fmt.Errorf("invalid ttl %q: expected a non-negative duration", v)
+		}
+		return v, nil
+	}
+	segments := ttlUnitPattern.FindAllString(v, -1)
+	if strings.Join(segments, "") != v {
+		return "", fmt.Errorf("invalid ttl %q", v)
+	}
+	total := new(big.Rat)
+	for _, segment := range segments {
+		n, ok := new(big.Rat).SetString(segment[:len(segment)-1])
+		if !ok {
+			return "", fmt.Errorf("invalid ttl %q", v)
+		}
+		units := map[byte]time.Duration{'s': time.Second, 'm': time.Minute, 'h': time.Hour, 'd': 24 * time.Hour, 'w': 7 * 24 * time.Hour}
+		total.Add(total, n.Mul(n, new(big.Rat).SetInt64(int64(units[segment[len(segment)-1]]))))
+	}
+	if total.Cmp(new(big.Rat).SetInt64(math.MaxInt64)) > 0 {
+		return "", fmt.Errorf("invalid ttl %q: duration out of range", v)
+	}
+	nanos := new(big.Int).Quo(total.Num(), total.Denom())
+	return time.Duration(nanos.Int64()).String(), nil
+}
+
+func validateTTL(v string) error {
+	_, err := normalizeTTL(v)
+	return err
+}
+
+func validateKeyctlScope(scope string) error {
+	switch scope {
+	case "session", "user", "usersession":
+		return nil
+	default:
+		return fmt.Errorf("invalid cache keyctl scope %q: expected session, user, or usersession", scope)
+	}
+}
+
+// parseClientTimeout accepts Vault-style plain seconds or a Go duration.
+func parseClientTimeout(v string) (time.Duration, error) {
+	if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if n <= 0 || n > (math.MaxInt64-int64(10*time.Second))/int64(time.Second) {
+			return 0, fmt.Errorf("must be positive, got %q", v)
+		}
+		return time.Duration(n) * time.Second, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("must be seconds or a Go duration, got %q", v)
+	}
+	if d <= 0 || d > time.Duration(math.MaxInt64)-10*time.Second {
+		return 0, fmt.Errorf("must be positive, got %q", v)
+	}
+	return d, nil
+}
+
+// expandHome expands a leading ~ to the current user's home directory.
+func expandHome(v string) (string, error) {
+	if v == "" {
+		return "", nil
+	}
+	if v != "~" && !strings.HasPrefix(v, "~/") && !strings.HasPrefix(v, `~\`) {
+		return v, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("expand ~ in %q: %w", v, err)
+	}
+	rest := strings.TrimLeft(strings.TrimPrefix(v, "~"), `/\`)
+	if rest == "" {
+		return home, nil
+	}
+	return filepath.Join(home, filepathLike(rest)), nil
+}
+
+// filepathLike normalizes separators in the remainder of a ~-path so Windows
+// style paths keep working.
+func filepathLike(v string) string {
+	return strings.ReplaceAll(v, "/", string(os.PathSeparator))
 }
 
 func splitCSV(v string) []string {
@@ -328,116 +525,14 @@ func splitCSV(v string) []string {
 	return out
 }
 
-func applyFileConfig(cfg *Config, fc fileConfig) {
-	if fc.VaultAddr != "" {
-		cfg.VaultAddr = fc.VaultAddr
-	}
-	if fc.VaultCACert != "" {
-		cfg.VaultCACert = fc.VaultCACert
-	}
-	if fc.VaultCAPath != "" {
-		cfg.VaultCAPath = fc.VaultCAPath
-	}
-	if fc.VaultNamespace != "" {
-		cfg.VaultNamespace = fc.VaultNamespace
-	}
-	if fc.VaultToken != "" {
-		cfg.VaultToken = fc.VaultToken
-	}
-	if fc.VaultTokenHelper != "" {
-		cfg.VaultTokenHelper = fc.VaultTokenHelper
-	}
-	if fc.VaultSkipVerify != nil {
-		cfg.VaultSkipVerify = *fc.VaultSkipVerify
-	}
-	if fc.Mount != "" {
-		cfg.Mount = fc.Mount
-	}
-	if fc.Role != "" {
-		cfg.Role = fc.Role
-	}
-	if fc.TTL != "" {
-		cfg.TTL = fc.TTL
-	}
-	if fc.CredentialType != "" {
-		cfg.CredentialType = fc.CredentialType
-	}
-	if fc.CacheCredentials != nil {
-		cfg.CacheCredentials = *fc.CacheCredentials
-	}
-}
-
-func applyEnvConfig(cfg *Config, env map[string]string) {
-	if v := env["VAULTCREDS_CONFIG"]; v != "" {
-		cfg.ConfigPath = v
-	}
-	if v := env["VAULT_ADDR"]; v != "" {
-		cfg.VaultAddr = v
-	}
-	if v := env["VAULT_CACERT"]; v != "" {
-		cfg.VaultCACert = v
-	}
-	if v := env["VAULT_CAPATH"]; v != "" {
-		cfg.VaultCAPath = v
-	}
-	if v := env["VAULT_NAMESPACE"]; v != "" {
-		cfg.VaultNamespace = v
-	}
-	if v := env["VAULT_TOKEN"]; v != "" {
-		cfg.VaultToken = v
-	}
-	if v := env["VAULT_TOKEN_HELPER"]; v != "" {
-		cfg.VaultTokenHelper = v
-	}
-	if v := env["VAULT_SKIP_VERIFY"]; v != "" {
-		parsed, err := strconv.ParseBool(v)
-		if err == nil {
-			cfg.VaultSkipVerify = parsed
-		}
-	}
-	if v := env["VAULTCREDS_MOUNT"]; v != "" {
-		cfg.Mount = v
-	}
-	if v := env["VAULTCREDS_ROLE"]; v != "" {
-		cfg.Role = v
-	}
-	if v := env["VAULTCREDS_TTL"]; v != "" {
-		cfg.TTL = v
-	}
-	if v := env["VAULTCREDS_CREDENTIAL_TYPE"]; v != "" {
-		cfg.CredentialType = v
-	}
-	if v := env["VAULTCREDS_CACHE_CREDENTIALS"]; v != "" {
-		parsed, err := strconv.ParseBool(v)
-		if err == nil {
-			cfg.CacheCredentials = parsed
-		}
-	}
-}
-
 func envMap(environ []string) map[string]string {
 	m := make(map[string]string, len(environ))
-	for _, kv := range environ {
-		parts := strings.SplitN(kv, "=", 2)
+	for _, pair := range environ {
+		parts := strings.SplitN(pair, "=", 2)
 		if len(parts) != 2 {
 			continue
 		}
 		m[parts[0]] = parts[1]
 	}
 	return m
-}
-
-func findConfigPathArg(args []string) (string, bool) {
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		switch {
-		case arg == "-c" || arg == "--config":
-			if i+1 < len(args) {
-				return args[i+1], true
-			}
-		case strings.HasPrefix(arg, "--config="):
-			return strings.TrimPrefix(arg, "--config="), true
-		}
-	}
-	return "", false
 }

@@ -18,13 +18,28 @@ import (
 	"time"
 )
 
+// requireTool skips a test when a prerequisite binary is missing, but fails
+// (instead of silently skipping) when the run is marked as requiring it, so
+// CI cannot go green while the whole e2e suite never executed.
+func requireTool(t *testing.T, name string) {
+	t.Helper()
+	if _, err := exec.LookPath(name); err != nil {
+		required := os.Getenv("VAULTCREDS_E2E_REQUIRE")
+		if required == "1" || strings.EqualFold(required, "true") || os.Getenv("CI") != "" {
+			t.Fatalf("%s binary not found but is required for this run", name)
+		}
+		t.Skipf("%s binary not found", name)
+	}
+}
+
+func requireVaultAndGo(t *testing.T) {
+	t.Helper()
+	requireTool(t, "vault")
+	requireTool(t, "go")
+}
+
 func TestVaultCredsWithVaultDevSTS(t *testing.T) {
-	if _, err := exec.LookPath("vault"); err != nil {
-		t.Skip("vault binary not found")
-	}
-	if _, err := exec.LookPath("go"); err != nil {
-		t.Skip("go binary not found")
-	}
+	requireVaultAndGo(t)
 
 	aws := newAWSMockServer()
 	defer aws.Close()
@@ -38,8 +53,8 @@ func TestVaultCredsWithVaultDevSTS(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	vaultCmd := exec.CommandContext(ctx, "vault", "server", "-dev", "-dev-root-token-id=root", "-dev-listen-address=127.0.0.1:"+fmt.Sprint(port))
-	vaultCmd.Env = append(os.Environ(), "VAULT_ADDR="+addr)
+	vaultCmd := exec.CommandContext(ctx, "vault", "server", "-dev", "-dev-no-store-token", "-dev-root-token-id=root", "-dev-listen-address=127.0.0.1:"+fmt.Sprint(port))
+	vaultCmd.Env = append(cleanVaultCredsEnv(), "VAULT_ADDR="+addr)
 	vaultOut, err := os.CreateTemp(t.TempDir(), "vault-dev-*.log")
 	if err != nil {
 		t.Fatalf("create vault log: %v", err)
@@ -55,7 +70,7 @@ func TestVaultCredsWithVaultDevSTS(t *testing.T) {
 		_ = vaultCmd.Wait()
 	}()
 
-	waitForVault(t, addr)
+	waitForVault(t, addr, vaultOut.Name())
 
 	runVault(t, addr, "secrets", "enable", "-path=aws", "aws")
 	configureAWSRoot(t, addr, aws.URL(), aws.URL())
@@ -73,7 +88,7 @@ func TestVaultCredsWithVaultDevSTS(t *testing.T) {
 
 	cmd := exec.Command("go", "run", "./cmd/vaultcreds", "--mount=aws", "--role=dev-role", "--type=sts")
 	cmd.Dir = repoRoot
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(cleanVaultCredsEnv(),
 		"VAULT_ADDR="+addr,
 		"VAULT_TOKEN=root",
 	)
@@ -96,12 +111,7 @@ func TestVaultCredsWithVaultDevSTS(t *testing.T) {
 }
 
 func TestVaultCredsWithVaultDevCreds(t *testing.T) {
-	if _, err := exec.LookPath("vault"); err != nil {
-		t.Skip("vault binary not found")
-	}
-	if _, err := exec.LookPath("go"); err != nil {
-		t.Skip("go binary not found")
-	}
+	requireVaultAndGo(t)
 
 	aws := newAWSMockServer()
 	defer aws.Close()
@@ -115,8 +125,8 @@ func TestVaultCredsWithVaultDevCreds(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	vaultCmd := exec.CommandContext(ctx, "vault", "server", "-dev", "-dev-root-token-id=root", "-dev-listen-address=127.0.0.1:"+fmt.Sprint(port))
-	vaultCmd.Env = append(os.Environ(), "VAULT_ADDR="+addr)
+	vaultCmd := exec.CommandContext(ctx, "vault", "server", "-dev", "-dev-no-store-token", "-dev-root-token-id=root", "-dev-listen-address=127.0.0.1:"+fmt.Sprint(port))
+	vaultCmd.Env = append(cleanVaultCredsEnv(), "VAULT_ADDR="+addr)
 	vaultOut, err := os.CreateTemp(t.TempDir(), "vault-dev-*.log")
 	if err != nil {
 		t.Fatalf("create vault log: %v", err)
@@ -132,7 +142,7 @@ func TestVaultCredsWithVaultDevCreds(t *testing.T) {
 		_ = vaultCmd.Wait()
 	}()
 
-	waitForVault(t, addr)
+	waitForVault(t, addr, vaultOut.Name())
 
 	runVault(t, addr, "secrets", "enable", "-path=aws", "aws")
 	configureAWSRoot(t, addr, aws.URL(), aws.URL())
@@ -148,40 +158,40 @@ func TestVaultCredsWithVaultDevCreds(t *testing.T) {
 	}
 	repoRoot = filepath.Clean(filepath.Join(repoRoot, "..", ".."))
 
-	cmd := exec.Command("go", "run", "./cmd/vaultcreds", "--mount=aws", "--role=dev-creds-role", "--type=creds")
-	cmd.Dir = repoRoot
-	cmd.Env = append(os.Environ(),
-		"VAULT_ADDR="+addr,
-		"VAULT_TOKEN=root",
-	)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("run vaultcreds: %v\noutput: %s", err, string(out))
-	}
+	for _, credentialType := range []string{"creds", "sts"} {
+		cmd := exec.Command("go", "run", "./cmd/vaultcreds", "--mount=aws", "--role=dev-creds-role", "--type="+credentialType, "--ttl=1d12h")
+		cmd.Dir = repoRoot
+		cmd.Env = append(cleanVaultCredsEnv(),
+			"VAULT_ADDR="+addr,
+			"VAULT_TOKEN=root",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("run vaultcreds: %v\noutput: %s", err, string(out))
+		}
 
-	var payload map[string]any
-	if err := json.Unmarshal(out, &payload); err != nil {
-		t.Fatalf("parse vaultcreds output: %v\noutput: %s", err, string(out))
-	}
-	if payload["AccessKeyId"] == "" || payload["SecretAccessKey"] == "" {
-		t.Fatalf("missing credentials in output: %#v", payload)
-	}
-	if sessionToken, ok := payload["SessionToken"]; ok && sessionToken != "" {
-		t.Fatalf("expected creds type to omit session token, got: %#v", payload)
-	}
+		var payload map[string]any
+		if err := json.Unmarshal(out, &payload); err != nil {
+			t.Fatalf("parse vaultcreds output: %v\noutput: %s", err, string(out))
+		}
+		if payload["AccessKeyId"] == "" || payload["SecretAccessKey"] == "" {
+			t.Fatalf("missing credentials in output: %#v", payload)
+		}
+		if sessionToken, ok := payload["SessionToken"]; ok && sessionToken != "" {
+			t.Fatalf("expected creds type to omit session token, got: %#v", payload)
+		}
 
-	if aws.ActionCount("CreateAccessKey") == 0 {
-		t.Fatalf("mock IAM never received CreateAccessKey; counts=%v", aws.Counts())
+		if aws.ActionCount("CreateAccessKey") == 0 {
+			t.Fatalf("mock IAM never received CreateAccessKey; counts=%v", aws.Counts())
+		}
+		if payload["Version"] != float64(1) {
+			t.Fatalf("invalid credential-process Version: %v", payload["Version"])
+		}
 	}
 }
 
 func TestVaultCredsWithVaultConfigTLSSTS(t *testing.T) {
-	if _, err := exec.LookPath("vault"); err != nil {
-		t.Skip("vault binary not found")
-	}
-	if _, err := exec.LookPath("go"); err != nil {
-		t.Skip("go binary not found")
-	}
+	requireVaultAndGo(t)
 
 	aws := newAWSMockServer()
 	defer aws.Close()
@@ -229,12 +239,7 @@ func TestVaultCredsWithVaultConfigTLSSTS(t *testing.T) {
 }
 
 func TestVaultCredsWithVaultConfigTLSCreds(t *testing.T) {
-	if _, err := exec.LookPath("vault"); err != nil {
-		t.Skip("vault binary not found")
-	}
-	if _, err := exec.LookPath("go"); err != nil {
-		t.Skip("go binary not found")
-	}
+	requireVaultAndGo(t)
 
 	aws := newAWSMockServer()
 	defer aws.Close()
@@ -339,23 +344,37 @@ func runVault(t *testing.T, addr string, args ...string) {
 
 func runVaultWithOutput(addr string, args ...string) (string, error) {
 	cmd := exec.Command("vault", args...)
-	cmd.Env = append(os.Environ(), "VAULT_ADDR="+addr, "VAULT_TOKEN=root", "VAULT_SKIP_VERIFY=true")
+	cmd.Env = append(cleanVaultCredsEnv(), "VAULT_ADDR="+addr, "VAULT_TOKEN=root", "VAULT_SKIP_VERIFY=true")
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
 
-func waitForVault(t *testing.T, addr string) {
+func waitForVault(t *testing.T, addr, logPath string) {
 	t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
+	var lastErr error
 	for time.Now().Before(deadline) {
 		cmd := exec.Command("vault", "status", "-address="+addr)
-		cmd.Env = append(os.Environ(), "VAULT_ADDR="+addr, "VAULT_SKIP_VERIFY=true")
-		if err := cmd.Run(); err == nil {
+		cmd.Env = append(cleanVaultCredsEnv(), "VAULT_ADDR="+addr, "VAULT_SKIP_VERIFY=true")
+		if out, err := cmd.CombinedOutput(); err == nil {
 			return
+		} else {
+			lastErr = fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
-	t.Fatalf("vault did not become ready at %s", addr)
+	t.Fatalf("vault did not become ready at %s (last status error: %v)\n--- vault log tail ---\n%s", addr, lastErr, tailFile(logPath, 4096))
+}
+
+func tailFile(path string, maxBytes int) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Sprintf("<unable to read %s: %v>", path, err)
+	}
+	if len(b) > maxBytes {
+		b = b[len(b)-maxBytes:]
+	}
+	return string(b)
 }
 
 func freePort() (int, error) {
@@ -379,6 +398,7 @@ func startVaultDev(t *testing.T, withTLS bool) (string, string, func()) {
 	args := []string{
 		"server",
 		"-dev",
+		"-dev-no-store-token",
 		"-dev-root-token-id=root",
 		"-dev-listen-address=127.0.0.1:" + fmt.Sprint(port),
 	}
@@ -393,7 +413,7 @@ func startVaultDev(t *testing.T, withTLS bool) (string, string, func()) {
 	addr := fmt.Sprintf("%s://127.0.0.1:%d", scheme, port)
 	ctx, cancel := context.WithCancel(t.Context())
 	vaultCmd := exec.CommandContext(ctx, "vault", args...)
-	vaultCmd.Env = append(os.Environ(), "VAULT_ADDR="+addr)
+	vaultCmd.Env = append(cleanVaultCredsEnv(), "VAULT_ADDR="+addr)
 	vaultOut, err := os.CreateTemp(t.TempDir(), "vault-dev-*.log")
 	if err != nil {
 		t.Fatalf("create vault log: %v", err)
@@ -404,7 +424,7 @@ func startVaultDev(t *testing.T, withTLS bool) (string, string, func()) {
 		t.Fatalf("start vault dev server: %v", err)
 	}
 
-	waitForVault(t, addr)
+	waitForVault(t, addr, vaultOut.Name())
 	return addr, cacert, func() {
 		cancel()
 		_ = vaultCmd.Wait()

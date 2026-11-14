@@ -7,9 +7,12 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/freakinhippie/vault-aws-cli-credentials-go/internal/awscred"
 	"github.com/freakinhippie/vault-aws-cli-credentials-go/internal/cache"
@@ -19,8 +22,13 @@ import (
 
 var version = "dev"
 
+// credentialProcessSlack extends the Vault request timeout so the token
+// helper subprocess and the Vault request share one overall deadline without
+// the AWS CLI waiting indefinitely on a hung helper.
+const credentialProcessSlack = 10 * time.Second
+
 type tokenResolver interface {
-	Resolve(opts vault.TokenOptions) (string, error)
+	Resolve(ctx context.Context, opts vault.TokenOptions) (string, error)
 }
 
 type vaultClient interface {
@@ -39,7 +47,7 @@ type credentialCache interface {
 type runDeps struct {
 	newTokenResolver func() tokenResolver
 	newVaultClient   func(cfg vault.ClientConfig) (vaultClient, error)
-	newCacheStore    func() (credentialCache, error)
+	newCacheStore    func(context.Context, string) (credentialCache, error)
 }
 
 func defaultRunDeps() runDeps {
@@ -50,13 +58,16 @@ func defaultRunDeps() runDeps {
 		newVaultClient: func(cfg vault.ClientConfig) (vaultClient, error) {
 			return vault.NewClient(cfg)
 		},
-		newCacheStore: func() (credentialCache, error) {
-			return cache.NewDefaultStore()
+		newCacheStore: func(ctx context.Context, scope string) (credentialCache, error) {
+			return cache.NewProcessStore(ctx, scope)
 		},
 	}
 }
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == cache.WorkerArgument {
+		os.Exit(cache.RunWorker(os.Stdin, os.Stdout))
+	}
 	exitCode := run(os.Args[1:], os.Environ(), os.Stdout, os.Stderr)
 	os.Exit(exitCode)
 }
@@ -85,14 +96,26 @@ func runWithDeps(args []string, environ []string, stdout, stderr io.Writer, deps
 		_, _ = fmt.Fprintln(stdout, "configuration is valid")
 		return 0
 	}
+	// Bound the whole credential path (token helper + Vault request) with one
+	// deadline and honor SIGINT/SIGTERM so a hung token helper can never wedge
+	// the AWS CLI indefinitely.
+	rootCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	timeout := cfg.ClientTimeout
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(rootCtx, timeout+credentialProcessSlack)
+	defer cancel()
+
 	if cfg.IsCacheMaintenanceMode() {
-		return runCacheMaintenance(cfg, stdout, stderr, deps)
+		return runCacheMaintenance(ctx, cfg, stdout, stderr, deps)
 	}
 
 	cacheKey := cache.BuildKey(cfg.VaultAddr, cfg.VaultNamespace, cfg.Mount, cfg.Role, cfg.CredentialType, cfg.TTL)
 	var credentialCache credentialCache
 	if cfg.CacheCredentials {
-		credentialCache, err = deps.newCacheStore()
+		credentialCache, err = deps.newCacheStore(ctx, cfg.CacheKeyctlScope)
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "cache warning: disabling credential caching (%v)\n", err)
 			credentialCache = nil
@@ -102,8 +125,7 @@ func runWithDeps(args []string, environ []string, stdout, stderr io.Writer, deps
 			if err != nil {
 				_, _ = fmt.Fprintf(stderr, "cache warning: disabling credential caching after read failure (%v)\n", err)
 				credentialCache = nil
-			}
-			if ok {
+			} else if ok {
 				return writeOutput(stdout, stderr, awscred.ProcessOutput{
 					AccessKeyID:     cached.AccessKeyID,
 					SecretAccessKey: cached.SecretAccessKey,
@@ -115,7 +137,7 @@ func runWithDeps(args []string, environ []string, stdout, stderr io.Writer, deps
 	}
 
 	tokenResolver := deps.newTokenResolver()
-	token, err := tokenResolver.Resolve(vault.TokenOptions{
+	token, err := tokenResolver.Resolve(ctx, vault.TokenOptions{
 		Token:       cfg.VaultToken,
 		TokenHelper: cfg.VaultTokenHelper,
 	})
@@ -125,25 +147,27 @@ func runWithDeps(args []string, environ []string, stdout, stderr io.Writer, deps
 	}
 
 	client, err := deps.newVaultClient(vault.ClientConfig{
-		Addr:       cfg.VaultAddr,
-		Token:      token,
-		Namespace:  cfg.VaultNamespace,
-		CACertPath: cfg.VaultCACert,
-		CAPath:     cfg.VaultCAPath,
-		SkipVerify: cfg.VaultSkipVerify,
+		Addr:             cfg.VaultAddr,
+		Token:            token,
+		Namespace:        cfg.VaultNamespace,
+		CACertPath:       cfg.VaultCACert,
+		CAPath:           cfg.VaultCAPath,
+		SkipVerify:       cfg.VaultSkipVerify,
+		ClientTimeout:    cfg.ClientTimeout,
+		DisableRedirects: cfg.VaultDisableRedirects,
 	})
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "vault client error: %v\n", err)
 		return 2
 	}
 
-	creds, err := client.GetAWSCredentials(context.Background(), cfg.Mount, cfg.Role, cfg.CredentialType, cfg.TTL)
+	creds, err := client.GetAWSCredentials(ctx, cfg.Mount, cfg.Role, cfg.CredentialType, cfg.TTL)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "vault request error: %v\n", err)
 		return 1
 	}
 
-	if credentialCache != nil {
+	if credentialCache != nil && creds.Expiration != nil {
 		if err := credentialCache.Save(cacheKey, cache.CachedCredentials{
 			AccessKeyID:     creds.AccessKeyID,
 			SecretAccessKey: creds.SecretAccessKey,
@@ -162,13 +186,13 @@ func runWithDeps(args []string, environ []string, stdout, stderr io.Writer, deps
 	})
 }
 
-func runCacheMaintenance(cfg config.Config, stdout, stderr io.Writer, deps runDeps) int {
+func runCacheMaintenance(ctx context.Context, cfg config.Config, stdout, stderr io.Writer, deps runDeps) int {
 	if cfg.CacheKeyringRecoveryHelp {
 		_, _ = fmt.Fprintln(stdout, keyringRecoveryHelp())
 		return 0
 	}
 
-	store, err := deps.newCacheStore()
+	store, err := deps.newCacheStore(ctx, cfg.CacheKeyctlScope)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "cache maintenance error: %v\n", err)
 		return 2
@@ -178,8 +202,11 @@ func runCacheMaintenance(cfg config.Config, stdout, stderr io.Writer, deps runDe
 	case cfg.CacheList:
 		entries, err := store.ListEntries()
 		if err != nil {
-			_, _ = fmt.Fprintf(stderr, "cache maintenance error: %v\n", err)
-			return 2
+			if len(entries) == 0 {
+				_, _ = fmt.Fprintf(stderr, "cache maintenance error: %v\n", err)
+				return 2
+			}
+			_, _ = fmt.Fprintf(stderr, "cache warning: some entries could not be read (%v)\n", err)
 		}
 		if len(entries) == 0 {
 			_, _ = fmt.Fprintln(stdout, "no cache entries found")
@@ -187,12 +214,15 @@ func runCacheMaintenance(cfg config.Config, stdout, stderr io.Writer, deps runDe
 		}
 		for _, entry := range entries {
 			status := "valid"
+			switch {
+			case entry.Corrupt:
+				status = "corrupt"
+			case entry.Expired:
+				status = "expired"
+			}
 			exp := "n/a"
 			if entry.Expiration != nil {
 				exp = entry.Expiration.UTC().Format(timeLayout)
-				if entry.Expired {
-					status = "expired"
-				}
 			}
 			_, _ = fmt.Fprintf(stdout, "%s\taccess_key=%s\texpires=%s\tstatus=%s\n", entry.Key, entry.AccessKey, exp, status)
 		}
@@ -207,9 +237,11 @@ func runCacheMaintenance(cfg config.Config, stdout, stderr io.Writer, deps runDe
 		return 0
 	case cfg.CachePurgeExpired:
 		n, err := store.PurgeExpired()
-		if err != nil {
+		if err != nil && n == 0 {
 			_, _ = fmt.Fprintf(stderr, "cache maintenance error: %v\n", err)
 			return 2
+		} else if err != nil {
+			_, _ = fmt.Fprintf(stderr, "cache warning: purged %d entries but some could not be read (%v)\n", n, err)
 		}
 		_, _ = fmt.Fprintf(stdout, "purged %d expired cache entr(ies)\n", n)
 		return 0
@@ -262,7 +294,25 @@ Windows guidance:
 	}
 }
 
+// writeOutput emits the AWS credential_process protocol payload, enforcing
+// the contract boundary: never print an empty or malformed credential document
+// with exit code 0.
 func writeOutput(stdout, stderr io.Writer, payload awscred.ProcessOutput) int {
+	if payload.AccessKeyID == "" || payload.SecretAccessKey == "" {
+		_, _ = fmt.Fprintln(stderr, "output error: refusing to emit credentials without an access key or secret key")
+		return 1
+	}
+	if payload.Expiration != nil {
+		if strings.TrimSpace(*payload.Expiration) == "" {
+			_, _ = fmt.Fprintln(stderr, "output error: refusing to emit credentials with an empty expiration")
+			return 1
+		}
+		if _, err := time.Parse(time.RFC3339, *payload.Expiration); err != nil {
+			_, _ = fmt.Fprintf(stderr, "output error: invalid expiration %q (want RFC3339)\n", *payload.Expiration)
+			return 1
+		}
+	}
+
 	out, err := payload.JSON()
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "output encoding error: %v\n", err)

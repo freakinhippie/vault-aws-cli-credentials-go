@@ -13,11 +13,14 @@ import (
 )
 
 type fakeTokenResolver struct {
-	token string
-	err   error
+	token        string
+	err          error
+	deadlineSeen bool
 }
 
-func (f fakeTokenResolver) Resolve(_ vault.TokenOptions) (string, error) {
+func (f *fakeTokenResolver) Resolve(ctx context.Context, _ vault.TokenOptions) (string, error) {
+	_, hasDeadline := ctx.Deadline()
+	f.deadlineSeen = hasDeadline
 	if f.err != nil {
 		return "", f.err
 	}
@@ -139,7 +142,7 @@ func TestRunHelp(t *testing.T) {
 	if !strings.Contains(stdout.String(), "Usage:") || !strings.Contains(stdout.String(), "--vault-addr") {
 		t.Fatalf("unexpected help output: %q", stdout.String())
 	}
-	if !strings.Contains(stdout.String(), "credential_process = ") || !strings.Contains(stdout.String(), "--vault-addr=https://vault.example.com --role=dev-role") {
+	if !strings.Contains(stdout.String(), "credential_process = ") || !strings.Contains(stdout.String(), "--vault-addr=https://vault.example.com:8200 --role=dev-role") {
 		t.Fatalf("missing credential_process sts example: %q", stdout.String())
 	}
 	if !strings.Contains(stdout.String(), "--mount=aws-team --role=app-role --type=creds") {
@@ -160,13 +163,13 @@ func TestRunVersion(t *testing.T) {
 	deps := runDeps{
 		newTokenResolver: func() tokenResolver {
 			tokenResolverCalled = true
-			return fakeTokenResolver{}
+			return &fakeTokenResolver{}
 		},
 		newVaultClient: func(cfg vault.ClientConfig) (vaultClient, error) {
 			vaultClientCalled = true
 			return fakeVaultClient{}, nil
 		},
-		newCacheStore: func() (credentialCache, error) {
+		newCacheStore: func(context.Context, string) (credentialCache, error) {
 			cacheStoreCalled = true
 			return &fakeCacheStore{}, nil
 		},
@@ -204,13 +207,13 @@ func TestRunCacheHitSkipsVault(t *testing.T) {
 
 	deps := runDeps{
 		newTokenResolver: func() tokenResolver {
-			return fakeTokenResolver{token: "token"}
+			return &fakeTokenResolver{token: "token"}
 		},
 		newVaultClient: func(cfg vault.ClientConfig) (vaultClient, error) {
 			vaultCalled = true
 			return fakeVaultClient{}, nil
 		},
-		newCacheStore: func() (credentialCache, error) {
+		newCacheStore: func(context.Context, string) (credentialCache, error) {
 			return cacheStore, nil
 		},
 	}
@@ -236,6 +239,12 @@ func TestRunCacheHitSkipsVault(t *testing.T) {
 	if out["AccessKeyId"] != "AKIA_CACHE" {
 		t.Fatalf("unexpected output: %#v", out)
 	}
+	if version, ok := out["Version"].(float64); !ok || version != 1 {
+		t.Fatalf("cache-hit output must carry Version=1: %s", stdout.String())
+	}
+	if out["SessionToken"] != "SESSION_CACHE" {
+		t.Fatalf("cache-hit output missing SessionToken: %s", stdout.String())
+	}
 }
 
 func TestRunTokenError(t *testing.T) {
@@ -243,12 +252,12 @@ func TestRunTokenError(t *testing.T) {
 
 	deps := runDeps{
 		newTokenResolver: func() tokenResolver {
-			return fakeTokenResolver{err: errors.New("no token")}
+			return &fakeTokenResolver{err: errors.New("no token")}
 		},
 		newVaultClient: func(cfg vault.ClientConfig) (vaultClient, error) {
 			return fakeVaultClient{}, nil
 		},
-		newCacheStore: func() (credentialCache, error) {
+		newCacheStore: func(context.Context, string) (credentialCache, error) {
 			return &fakeCacheStore{}, nil
 		},
 	}
@@ -269,12 +278,12 @@ func TestRunVaultError(t *testing.T) {
 
 	deps := runDeps{
 		newTokenResolver: func() tokenResolver {
-			return fakeTokenResolver{token: "token"}
+			return &fakeTokenResolver{token: "token"}
 		},
 		newVaultClient: func(cfg vault.ClientConfig) (vaultClient, error) {
 			return fakeVaultClient{err: errors.New("permission denied")}, nil
 		},
-		newCacheStore: func() (credentialCache, error) {
+		newCacheStore: func(context.Context, string) (credentialCache, error) {
 			return &fakeCacheStore{}, nil
 		},
 	}
@@ -298,7 +307,7 @@ func TestRunSuccessWritesCacheAndOutput(t *testing.T) {
 
 	deps := runDeps{
 		newTokenResolver: func() tokenResolver {
-			return fakeTokenResolver{token: "token"}
+			return &fakeTokenResolver{token: "token"}
 		},
 		newVaultClient: func(cfg vault.ClientConfig) (vaultClient, error) {
 			return fakeVaultClient{creds: vault.AWSCredentials{
@@ -308,7 +317,7 @@ func TestRunSuccessWritesCacheAndOutput(t *testing.T) {
 				Expiration:      &exp,
 			}}, nil
 		},
-		newCacheStore: func() (credentialCache, error) {
+		newCacheStore: func(context.Context, string) (credentialCache, error) {
 			return cacheStore, nil
 		},
 	}
@@ -335,6 +344,23 @@ func TestRunSuccessWritesCacheAndOutput(t *testing.T) {
 	if out["AccessKeyId"] != "AKIA" || out["SecretAccessKey"] != "SECRET" {
 		t.Fatalf("unexpected output: %#v", out)
 	}
+	// Full credential_process protocol contract.
+	version, ok := out["Version"].(float64)
+	if !ok || version != 1 {
+		t.Fatalf("Version must be integer 1: %s", stdout.String())
+	}
+	if out["SessionToken"] != "SESSION" {
+		t.Fatalf("SessionToken mismatch: %s", stdout.String())
+	}
+	if out["Expiration"] != "2026-02-24T20:00:00Z" {
+		t.Fatalf("Expiration must pass through as RFC3339 UTC: %s", stdout.String())
+	}
+	if len(out) != 5 {
+		t.Fatalf("unexpected field set: %#v", out)
+	}
+	if cacheStore.savedKey == "" {
+		t.Fatal("expected non-empty cache key")
+	}
 }
 
 func TestRunCacheSetupErrorFallsBackToNoCache(t *testing.T) {
@@ -343,7 +369,7 @@ func TestRunCacheSetupErrorFallsBackToNoCache(t *testing.T) {
 	vaultCalled := false
 	deps := runDeps{
 		newTokenResolver: func() tokenResolver {
-			return fakeTokenResolver{token: "token"}
+			return &fakeTokenResolver{token: "token"}
 		},
 		newVaultClient: func(cfg vault.ClientConfig) (vaultClient, error) {
 			vaultCalled = true
@@ -352,7 +378,7 @@ func TestRunCacheSetupErrorFallsBackToNoCache(t *testing.T) {
 				SecretAccessKey: "SECRET",
 			}}, nil
 		},
-		newCacheStore: func() (credentialCache, error) {
+		newCacheStore: func(context.Context, string) (credentialCache, error) {
 			return nil, errors.New("no secure backend")
 		},
 	}
@@ -378,7 +404,7 @@ func TestRunCacheReadErrorFallsBackToNoCache(t *testing.T) {
 	cacheStore := &fakeCacheStore{loadErr: errors.New("boom")}
 	deps := runDeps{
 		newTokenResolver: func() tokenResolver {
-			return fakeTokenResolver{token: "token"}
+			return &fakeTokenResolver{token: "token"}
 		},
 		newVaultClient: func(cfg vault.ClientConfig) (vaultClient, error) {
 			return fakeVaultClient{creds: vault.AWSCredentials{
@@ -386,7 +412,7 @@ func TestRunCacheReadErrorFallsBackToNoCache(t *testing.T) {
 				SecretAccessKey: "SECRET",
 			}}, nil
 		},
-		newCacheStore: func() (credentialCache, error) {
+		newCacheStore: func(context.Context, string) (credentialCache, error) {
 			return cacheStore, nil
 		},
 	}
@@ -410,17 +436,19 @@ func TestRunCacheWriteErrorWarnsButSucceeds(t *testing.T) {
 	t.Parallel()
 
 	cacheStore := &fakeCacheStore{saveErr: errors.New("write failed")}
+	exp := "2026-02-24T20:00:00Z"
 	deps := runDeps{
 		newTokenResolver: func() tokenResolver {
-			return fakeTokenResolver{token: "token"}
+			return &fakeTokenResolver{token: "token"}
 		},
 		newVaultClient: func(cfg vault.ClientConfig) (vaultClient, error) {
 			return fakeVaultClient{creds: vault.AWSCredentials{
 				AccessKeyID:     "AKIA",
 				SecretAccessKey: "SECRET",
+				Expiration:      &exp,
 			}}, nil
 		},
-		newCacheStore: func() (credentialCache, error) {
+		newCacheStore: func(context.Context, string) (credentialCache, error) {
 			return cacheStore, nil
 		},
 	}
@@ -451,9 +479,9 @@ func TestRunCacheList(t *testing.T) {
 		},
 	}
 	deps := runDeps{
-		newTokenResolver: func() tokenResolver { return fakeTokenResolver{} },
+		newTokenResolver: func() tokenResolver { return &fakeTokenResolver{} },
 		newVaultClient:   func(cfg vault.ClientConfig) (vaultClient, error) { return fakeVaultClient{}, nil },
-		newCacheStore:    func() (credentialCache, error) { return cacheStore, nil },
+		newCacheStore:    func(context.Context, string) (credentialCache, error) { return cacheStore, nil },
 	}
 
 	var stdout strings.Builder
@@ -475,9 +503,9 @@ func TestRunCachePurgeKeys(t *testing.T) {
 
 	cacheStore := &fakeCacheStore{}
 	deps := runDeps{
-		newTokenResolver: func() tokenResolver { return fakeTokenResolver{} },
+		newTokenResolver: func() tokenResolver { return &fakeTokenResolver{} },
 		newVaultClient:   func(cfg vault.ClientConfig) (vaultClient, error) { return fakeVaultClient{}, nil },
-		newCacheStore:    func() (credentialCache, error) { return cacheStore, nil },
+		newCacheStore:    func(context.Context, string) (credentialCache, error) { return cacheStore, nil },
 	}
 
 	var stdout strings.Builder
@@ -496,9 +524,9 @@ func TestRunCachePurgeExpired(t *testing.T) {
 
 	cacheStore := &fakeCacheStore{purgeExpiredN: 3}
 	deps := runDeps{
-		newTokenResolver: func() tokenResolver { return fakeTokenResolver{} },
+		newTokenResolver: func() tokenResolver { return &fakeTokenResolver{} },
 		newVaultClient:   func(cfg vault.ClientConfig) (vaultClient, error) { return fakeVaultClient{}, nil },
-		newCacheStore:    func() (credentialCache, error) { return cacheStore, nil },
+		newCacheStore:    func(context.Context, string) (credentialCache, error) { return cacheStore, nil },
 	}
 
 	var stdout strings.Builder
@@ -517,9 +545,9 @@ func TestRunCachePurgeAll(t *testing.T) {
 
 	cacheStore := &fakeCacheStore{purgeAllN: 4}
 	deps := runDeps{
-		newTokenResolver: func() tokenResolver { return fakeTokenResolver{} },
+		newTokenResolver: func() tokenResolver { return &fakeTokenResolver{} },
 		newVaultClient:   func(cfg vault.ClientConfig) (vaultClient, error) { return fakeVaultClient{}, nil },
-		newCacheStore:    func() (credentialCache, error) { return cacheStore, nil },
+		newCacheStore:    func(context.Context, string) (credentialCache, error) { return cacheStore, nil },
 	}
 
 	var stdout strings.Builder
@@ -537,9 +565,9 @@ func TestRunCacheKeyringRecoveryHelp(t *testing.T) {
 	t.Parallel()
 
 	deps := runDeps{
-		newTokenResolver: func() tokenResolver { return fakeTokenResolver{} },
+		newTokenResolver: func() tokenResolver { return &fakeTokenResolver{} },
 		newVaultClient:   func(cfg vault.ClientConfig) (vaultClient, error) { return fakeVaultClient{}, nil },
-		newCacheStore:    func() (credentialCache, error) { return &fakeCacheStore{}, nil },
+		newCacheStore:    func(context.Context, string) (credentialCache, error) { return &fakeCacheStore{}, nil },
 	}
 
 	var stdout strings.Builder
@@ -550,5 +578,171 @@ func TestRunCacheKeyringRecoveryHelp(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(stdout.String()), "reset") && !strings.Contains(strings.ToLower(stdout.String()), "recovery") {
 		t.Fatalf("unexpected help output: %q", stdout.String())
+	}
+}
+
+func TestRunSaveSkippedWhenNoExpiration(t *testing.T) {
+	t.Parallel()
+
+	cacheStore := &fakeCacheStore{}
+	deps := runDeps{
+		newTokenResolver: func() tokenResolver { return &fakeTokenResolver{token: "token"} },
+		newVaultClient: func(cfg vault.ClientConfig) (vaultClient, error) {
+			return fakeVaultClient{creds: vault.AWSCredentials{
+				AccessKeyID:     "AKIA",
+				SecretAccessKey: "SECRET",
+			}}, nil
+		},
+		newCacheStore: func(context.Context, string) (credentialCache, error) { return cacheStore, nil },
+	}
+
+	var stdout strings.Builder
+	var stderr strings.Builder
+	env := append(baseEnv(), "VAULTCREDS_CACHE_CREDENTIALS=true")
+	exit := runWithDeps(nil, env, &stdout, &stderr, deps)
+	if exit != 0 {
+		t.Fatalf("expected exit 0, got %d stderr=%q", exit, stderr.String())
+	}
+	if cacheStore.saveInvoked {
+		t.Fatal("credentials without an expiration must never be cached")
+	}
+	if strings.Contains(stdout.String(), "Expiration") {
+		t.Fatalf("unexpected Expiration in output: %s", stdout.String())
+	}
+}
+
+func TestRunRefusesEmptyCredentials(t *testing.T) {
+	t.Parallel()
+
+	deps := runDeps{
+		newTokenResolver: func() tokenResolver { return &fakeTokenResolver{token: "token"} },
+		newVaultClient: func(cfg vault.ClientConfig) (vaultClient, error) {
+			return fakeVaultClient{creds: vault.AWSCredentials{AccessKeyID: "AKIA"}}, nil
+		},
+		newCacheStore: func(context.Context, string) (credentialCache, error) { return &fakeCacheStore{}, nil },
+	}
+
+	var stdout strings.Builder
+	var stderr strings.Builder
+	exit := runWithDeps(nil, baseEnv(), &stdout, &stderr, deps)
+	if exit != 1 {
+		t.Fatalf("expected exit 1 for incomplete credentials, got %d", exit)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("nothing must be written to stdout, got %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "output error") {
+		t.Fatalf("expected output error, got %q", stderr.String())
+	}
+}
+
+func TestRunRejectsInvalidCachedExpiration(t *testing.T) {
+	t.Parallel()
+
+	empty := ""
+	cacheStore := &fakeCacheStore{
+		loadedHit: true,
+		loaded: cache.CachedCredentials{
+			AccessKeyID:     "AKIA",
+			SecretAccessKey: "SECRET",
+			Expiration:      &empty,
+		},
+	}
+	deps := runDeps{
+		newTokenResolver: func() tokenResolver { return &fakeTokenResolver{token: "token"} },
+		newVaultClient:   func(cfg vault.ClientConfig) (vaultClient, error) { return fakeVaultClient{}, nil },
+		newCacheStore:    func(context.Context, string) (credentialCache, error) { return cacheStore, nil },
+	}
+
+	var stdout strings.Builder
+	var stderr strings.Builder
+	env := append(baseEnv(), "VAULTCREDS_CACHE_CREDENTIALS=true")
+	exit := runWithDeps(nil, env, &stdout, &stderr, deps)
+	if exit != 1 {
+		t.Fatalf("expected exit 1 for empty expiration, got %d", exit)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("nothing must be written to stdout, got %q", stdout.String())
+	}
+}
+
+func TestRunTokenResolutionGetsDeadlineContext(t *testing.T) {
+	t.Parallel()
+
+	resolver := &fakeTokenResolver{token: "token"}
+	deps := runDeps{
+		newTokenResolver: func() tokenResolver { return resolver },
+		newVaultClient: func(cfg vault.ClientConfig) (vaultClient, error) {
+			return fakeVaultClient{creds: vault.AWSCredentials{
+				AccessKeyID:     "AKIA",
+				SecretAccessKey: "SECRET",
+			}}, nil
+		},
+		newCacheStore: func(context.Context, string) (credentialCache, error) { return &fakeCacheStore{}, nil },
+	}
+
+	var stdout strings.Builder
+	var stderr strings.Builder
+	if exit := runWithDeps(nil, baseEnv(), &stdout, &stderr, deps); exit != 0 {
+		t.Fatalf("expected exit 0, got %d stderr=%q", exit, stderr.String())
+	}
+	if !resolver.deadlineSeen {
+		t.Fatal("token resolution must receive a bounded context so a hung helper cannot wedge the AWS CLI")
+	}
+}
+
+func TestRunCacheListShowsCorruptStatus(t *testing.T) {
+	t.Parallel()
+
+	cacheStore := &fakeCacheStore{
+		listedEntries: []cache.Entry{
+			{Key: "corrupt-entry", Corrupt: true, Expired: true},
+		},
+	}
+	deps := runDeps{
+		newTokenResolver: func() tokenResolver { return &fakeTokenResolver{} },
+		newVaultClient:   func(cfg vault.ClientConfig) (vaultClient, error) { return fakeVaultClient{}, nil },
+		newCacheStore:    func(context.Context, string) (credentialCache, error) { return cacheStore, nil },
+	}
+
+	var stdout strings.Builder
+	var stderr strings.Builder
+	exit := runWithDeps([]string{"--cache-list"}, nil, &stdout, &stderr, deps)
+	if exit != 0 {
+		t.Fatalf("expected exit 0, got %d stderr=%q", exit, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "status=corrupt") {
+		t.Fatalf("expected corrupt status in listing, got %q", stdout.String())
+	}
+}
+
+func TestRunForwardsCacheScopeAndRedirectSettings(t *testing.T) {
+	t.Parallel()
+	cacheCalled, vaultCalled := false, false
+	deps := runDeps{
+		newTokenResolver: func() tokenResolver { return &fakeTokenResolver{token: "token"} },
+		newCacheStore: func(ctx context.Context, scope string) (credentialCache, error) {
+			cacheCalled = true
+			if scope != "user" {
+				t.Fatalf("scope=%q", scope)
+			}
+			if _, ok := ctx.Deadline(); !ok {
+				t.Fatal("cache path has no deadline")
+			}
+			return &fakeCacheStore{}, nil
+		},
+		newVaultClient: func(cfg vault.ClientConfig) (vaultClient, error) {
+			vaultCalled = true
+			if !cfg.DisableRedirects {
+				t.Fatal("redirect setting not forwarded")
+			}
+			return fakeVaultClient{creds: vault.AWSCredentials{AccessKeyID: "AKIA", SecretAccessKey: "SECRET"}}, nil
+		},
+	}
+	var stdout, stderr strings.Builder
+	env := append(baseEnv(), "VAULT_DISABLE_REDIRECTS=true")
+	exit := runWithDeps([]string{"--cache", "--cache-keyctl-scope=user"}, env, &stdout, &stderr, deps)
+	if exit != 0 || !cacheCalled || !vaultCalled {
+		t.Fatalf("exit=%d cache=%v vault=%v stderr=%s", exit, cacheCalled, vaultCalled, stderr.String())
 	}
 }
