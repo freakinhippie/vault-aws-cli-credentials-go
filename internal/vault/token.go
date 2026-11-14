@@ -1,13 +1,17 @@
 package vault
 
 import (
-	"bufio"
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/freakinhippie/vault-aws-cli-credentials-go/internal/kv"
+	"github.com/freakinhippie/vault-aws-cli-credentials-go/internal/subprocess"
 )
 
 var ErrNoTokenAvailable = errors.New("no vault token available")
@@ -15,8 +19,9 @@ var ErrNoTokenAvailable = errors.New("no vault token available")
 type TokenResolver struct {
 	HomeDir     string
 	ReadFile    func(path string) ([]byte, error)
-	ExecCommand func(name string, args ...string) (string, error)
+	ExecCommand func(ctx context.Context, name string, args ...string) (string, error)
 	LookPath    func(file string) (string, error)
+	LookupEnv   func(key string) (string, bool)
 }
 
 type TokenOptions struct {
@@ -30,7 +35,12 @@ func NewTokenResolver() *TokenResolver {
 	}
 }
 
-func (r *TokenResolver) Resolve(opts TokenOptions) (string, error) {
+// Resolve finds a Vault token: explicit token first, then the configured or
+// discovered token helper, then ~/.vault-token (only when no helper is
+// configured, matching the vault CLI where the file itself is the default
+// internal helper). Helper failures are surfaced, never silently masked by a
+// possibly-stale token file.
+func (r *TokenResolver) Resolve(ctx context.Context, opts TokenOptions) (string, error) {
 	if opts.Token != "" {
 		return opts.Token, nil
 	}
@@ -45,59 +55,98 @@ func (r *TokenResolver) Resolve(opts TokenOptions) (string, error) {
 	}
 
 	if helper != "" {
-		token, err := r.tokenFromHelper(helper)
-		if err == nil && token != "" {
+		token, err := r.tokenFromHelper(ctx, helper)
+		if err != nil {
+			return "", err
+		}
+		if token != "" {
 			return token, nil
 		}
+		return "", fmt.Errorf("%w: token helper %q returned no token", ErrNoTokenAvailable, helper)
 	}
 
 	token, err := r.tokenFromFile()
-	if err == nil && token != "" {
-		return token, nil
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", ErrNoTokenAvailable
+		}
+		return "", fmt.Errorf("read ~/.vault-token: %w", err)
 	}
-	return "", ErrNoTokenAvailable
+	if token == "" {
+		return "", ErrNoTokenAvailable
+	}
+	return token, nil
 }
 
+// discoverTokenHelper finds token_helper from the Vault CLI config, honoring
+// VAULT_CONFIG_PATH just like the vault CLI, falling back to ~/.vault.
 func (r *TokenResolver) discoverTokenHelper() (string, error) {
-	home, err := r.homeDir()
-	if err != nil {
-		return "", err
+	path := ""
+	if r.lookupEnv("VAULT_CONFIG_PATH") != "" {
+		path = r.lookupEnv("VAULT_CONFIG_PATH")
+	} else {
+		home, err := r.homeDir()
+		if err != nil {
+			return "", err
+		}
+		path = filepath.Join(home, ".vault")
 	}
-	b, err := r.readHomeFile(home, ".vault")
+
+	b, err := r.readFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return "", nil
 		}
-		return "", fmt.Errorf("read ~/.vault: %w", err)
+		return "", fmt.Errorf("read vault cli config %s: %w", path, err)
 	}
 
-	scanner := bufio.NewScanner(strings.NewReader(string(b)))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+	return parseTokenHelper(string(b))
+}
+
+// parseTokenHelper extracts token_helper from an HCL-style or JSON Vault CLI
+// config document.
+func parseTokenHelper(content string) (string, error) {
+	trimmed := strings.TrimSpace(content)
+	if strings.HasPrefix(trimmed, "{") {
+		var doc map[string]any
+		if err := json.Unmarshal([]byte(trimmed), &doc); err != nil {
+			return "", fmt.Errorf("parse vault cli config: %w", err)
+		}
+		raw, exists := doc["token_helper"]
+		if !exists {
+			return "", nil
+		}
+		value, ok := raw.(string)
+		if !ok {
+			return "", errors.New("vault cli config token_helper must be a string")
+		}
+		return strings.TrimSpace(value), nil
+	}
+
+	for _, raw := range strings.Split(trimmed, "\n") {
+		line := strings.TrimSpace(raw)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		if !strings.HasPrefix(line, "token_helper") {
-			continue
-		}
-		_, valuePart, ok := strings.Cut(line, "=")
+		key, value, ok := kv.SplitKeyValue(line)
 		if !ok {
+			keyPart, _, _ := strings.Cut(line, "=")
+			if strings.TrimSpace(keyPart) == "token_helper" {
+				return "", errors.New("malformed token_helper in vault cli config")
+			}
 			continue
 		}
-		v := strings.TrimSpace(valuePart)
-		v = stripQuotes(v)
-		if v != "" {
-			return v, nil
+		if key != "token_helper" {
+			continue
 		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return "", fmt.Errorf("scan ~/.vault: %w", err)
+		if value != "" {
+			return value, nil
+		}
 	}
 	return "", nil
 }
 
-func (r *TokenResolver) tokenFromHelper(helper string) (string, error) {
+func (r *TokenResolver) tokenFromHelper(ctx context.Context, helper string) (string, error) {
 	parts, err := splitCommand(helper)
 	if err != nil {
 		return "", err
@@ -106,13 +155,21 @@ func (r *TokenResolver) tokenFromHelper(helper string) (string, error) {
 		return "", errors.New("token helper command is empty")
 	}
 
-	name, err := r.resolveExecutable(parts[0])
+	executable := parts[0]
+	if executable == "~" || strings.HasPrefix(executable, "~/") || strings.HasPrefix(executable, `~\`) {
+		home, err := r.homeDir()
+		if err != nil {
+			return "", err
+		}
+		executable = filepath.Join(home, strings.TrimLeft(strings.TrimPrefix(executable, "~"), `/\`))
+	}
+	name, err := r.resolveExecutable(executable)
 	if err != nil {
 		return "", err
 	}
 
 	args := append(parts[1:], "get")
-	out, err := r.execCommand(name, args...)
+	out, err := r.execCommand(ctx, name, args...)
 	if err != nil {
 		return "", fmt.Errorf("token helper get failed: %w", err)
 	}
@@ -124,7 +181,7 @@ func (r *TokenResolver) tokenFromFile() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	b, err := r.readHomeFile(home, ".vault-token")
+	b, err := r.readFile(filepath.Join(home, ".vault-token"))
 	if err != nil {
 		return "", err
 	}
@@ -142,18 +199,15 @@ func (r *TokenResolver) homeDir() (string, error) {
 	return home, nil
 }
 
-func (r *TokenResolver) readHomeFile(home, name string) ([]byte, error) {
+// readFile reads home-relative files with ordinary semantics so symlinked
+// ~/.vault / ~/.vault-token files (a common secrets-injection pattern) work
+// the same way they do with the vault CLI.
+func (r *TokenResolver) readFile(path string) ([]byte, error) {
 	if r.ReadFile != nil {
-		return r.ReadFile(filepath.Join(home, name))
+		return r.ReadFile(path)
 	}
-
-	root, err := os.OpenRoot(home)
-	if err != nil {
-		return nil, fmt.Errorf("open home directory: %w", err)
-	}
-	defer root.Close()
-
-	return root.ReadFile(name)
+	// #nosec G304 -- Home-relative Vault CLI config/token files selected per vault CLI conventions.
+	return os.ReadFile(path)
 }
 
 func (r *TokenResolver) resolveExecutable(name string) (string, error) {
@@ -171,17 +225,17 @@ func (r *TokenResolver) resolveExecutable(name string) (string, error) {
 	return resolved, nil
 }
 
-func (r *TokenResolver) execCommand(name string, args ...string) (string, error) {
-	if r.ExecCommand == nil {
-		// #nosec G204 -- Token helpers are explicitly configured by the user/Vault and executed without a shell.
-		cmd := exec.Command(name, args...)
-		out, err := cmd.Output()
-		if err != nil {
-			return "", err
-		}
-		return strings.TrimSpace(string(out)), nil
+func (r *TokenResolver) execCommand(ctx context.Context, name string, args ...string) (string, error) {
+	if r.ExecCommand != nil {
+		return r.ExecCommand(ctx, name, args...)
 	}
-	return r.ExecCommand(name, args...)
+
+	cmd := subprocess.Command(ctx, name, args...)
+	out, err := subprocess.Run(ctx, cmd, 64<<10, 300)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 func (r *TokenResolver) lookPath(file string) (string, error) {
@@ -189,6 +243,14 @@ func (r *TokenResolver) lookPath(file string) (string, error) {
 		return exec.LookPath(file)
 	}
 	return r.LookPath(file)
+}
+
+func (r *TokenResolver) lookupEnv(key string) string {
+	if r.LookupEnv != nil {
+		v, _ := r.LookupEnv(key)
+		return v
+	}
+	return os.Getenv(key)
 }
 
 func hasPathSeparator(v string) bool {
@@ -225,13 +287,4 @@ func splitCommand(input string) ([]string, error) {
 		parts = append(parts, curr.String())
 	}
 	return parts, nil
-}
-
-func stripQuotes(v string) string {
-	if len(v) >= 2 {
-		if (v[0] == '"' && v[len(v)-1] == '"') || (v[0] == '\'' && v[len(v)-1] == '\'') {
-			return v[1 : len(v)-1]
-		}
-	}
-	return v
 }

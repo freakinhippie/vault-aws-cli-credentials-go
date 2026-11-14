@@ -33,6 +33,7 @@ builds:
   - id: vaultcreds-darwin
     main: ./cmd/vaultcreds
     binary: vaultcreds
+    # The Keychain backend and its Touch ID binding require Apple's SDK and CGO.
     env:
       - CGO_ENABLED=1
     goos:

@@ -57,13 +57,13 @@ Chocolatey publication is automated by the `Chocolatey Publish` workflow:
 - Integrity source: `checksums.txt` from the same GitHub release.
 - Manual retry option: workflow dispatch with a `tag` input.
 
-### 4) Add/host Chocolatey icon asset
+### 4) Chocolatey icon asset (not currently wired)
 
-`.goreleaser.yaml` references:
-
-`https://raw.githubusercontent.com/freakinhippie/vault-aws-cli-credentials-go/main/.github/assets/vaultcreds-icon.png`
-
-Ensure this file exists and is reachable for Chocolatey metadata.
+Neither `.goreleaser.yaml` nor the `Chocolatey Publish` workflow embeds a
+package icon today. Icon assets under `.github/assets/` are unused. To add an
+icon, first wire `chocolateys.icon` in `.goreleaser.yaml` (or `iconUrl` in the
+workflow's generated nuspec) and ensure the referenced URL is reachable; do
+not assume an icon is published until that wiring exists.
 
 ## Recommended Release Steps
 
@@ -75,5 +75,10 @@ Ensure this file exists and is reachable for Chocolatey metadata.
 
 ## Notes
 
-- The workflow intentionally publishes from a macOS runner to support darwin builds with `CGO_ENABLED=1`.
+- The workflow intentionally publishes from a macOS runner: the Byteness
+  Keychain backend requires `CGO_ENABLED=1` and Apple's SDK. Disabling caching
+  at runtime does not remove this compile-time dependency. Linux and Windows
+  binaries continue to cross-compile with `CGO_ENABLED=0`.
+- Apple code signing and notarization also use macOS tooling independently of
+  the CGO requirement.
 - Chocolatey publication runs as a separate Windows workflow after release publication.
